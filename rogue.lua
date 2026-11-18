@@ -3,11 +3,29 @@
 --//   * "Rogue Lineage" Matcha tab: Spectate on/off toggle + named configs (one JSON file each in
 --//     RogueLineage/configs/, pick which one to load; the last one used is autoloaded at start)
 --//
+--// Only runs in PlaceId 5208655184 or 3541987450. In any other place NOTHING below the gate executes.
+--// The whole script body runs inside one pcall, so an error anywhere can't take anything else down.
+--//
 --// Locals: the main chunk only has `RL`. Everything else lives on the RL table, and the spectate body
 --// keeps its own do-blocks (v13) so it stays well under Lua 5.1's 200-locals-per-function limit.
 --//
 --// ADDING A FEATURE LATER: add one row to RL.items (id = the UI widget id, key = the name in the JSON,
 --// default = value used when the config has nothing). Save/Load/autoload then handle it automatically.
+
+--==============================================================
+-- PLACE GATE (first thing in the script)
+--==============================================================
+local ALLOWED_PLACES = { [5208655184] = true, [3541987450] = true }
+local PLACE_OK = false
+do
+	local okP, pid = pcall(function() return game.PlaceId end)
+	pid = okP and tonumber(pid) or nil
+	if pid and ALLOWED_PLACES[pid] then PLACE_OK = true end
+end
+
+if PLACE_OK then
+
+local mainOk, mainErr = pcall(function()
 
 local RL = {
 	dir     = "RogueLineage",
@@ -592,6 +610,56 @@ end
 --==============================================================
 -- PLAYER SAMPLING (attributes + name map) — polling, no events
 --==============================================================
+-- name data can live in different places depending on the map: Player attribute, Character attribute,
+-- or a ValueObject child (StringValue etc.) of the Player or Character. Check all of them.
+local function nameAttr(p, char, key)
+	local v = attr(p, key)
+	if v ~= nil and v ~= "" then return v end
+	if char then
+		local okC, c = pcall(function() return char:GetAttribute(key) end)
+		if okC and c ~= nil and c ~= "" then return c end
+	end
+	local holders = { p, char }
+	for i = 1, 2 do
+		local holder = holders[i]
+		if holder then
+			local okV, r = pcall(function()
+				local o = holder:FindFirstChild(key)
+				if o then return o.Value end
+			end)
+			if okV and r ~= nil and r ~= "" then return r end
+		end
+	end
+	return nil
+end
+
+-- prints (once) everything attached to a player that has no name data, so the right place can be found
+local dumped = false
+local function dumpOnce(p, char)
+	if dumped then return end
+	dumped = true
+	pcall(function()
+		local function list(inst, label)
+			local parts = {}
+			pcall(function()
+				for k, v in pairs(inst:GetAttributes()) do parts[#parts + 1] = "@" .. tostring(k) .. "=" .. tostring(v) end
+			end)
+			pcall(function()
+				for _, c in ipairs(inst:GetChildren()) do
+					local cn = ""
+					pcall(function() cn = c.ClassName end)
+					local val = ""
+					pcall(function() if string.find(cn, "Value") then val = "=" .. tostring(c.Value) end end)
+					parts[#parts + 1] = tostring(c.Name) .. "[" .. cn .. "]" .. val
+				end
+			end)
+			pcall(print, "[SPEC] no name data for " .. tostring(p.Name) .. " (" .. label .. "): " .. table.concat(parts, ", "))
+		end
+		list(p, "Player")
+		if char then list(char, "Character") end
+	end)
+end
+
 local function sample()
 	local reveal = REVEAL_HIDDEN == true and inMenu
 	local seen, nm = {}, {}
@@ -605,9 +673,10 @@ local function sample()
 				Data[p] = d
 			end
 
-			d.first, d.uber, d.last = attr(p, "FirstName"), attr(p, "UberTitle"), attr(p, "LastName")
-			d.rank, d.gender = attr(p, "HouseRank"), attr(p, "Gender")
-			d.prestige, d.edict = attr(p, "Prestige"), attr(p, "MaxEdict")
+			local char = p.Character
+			d.first, d.uber, d.last = nameAttr(p, char, "FirstName"), nameAttr(p, char, "UberTitle"), nameAttr(p, char, "LastName")
+			d.rank, d.gender = nameAttr(p, char, "HouseRank"), nameAttr(p, char, "Gender")
+			d.prestige, d.edict = nameAttr(p, char, "Prestige"), nameAttr(p, char, "MaxEdict")
 
 			local hid = attr(p, "Hidden")
 			if reveal and p ~= LocalPlayer then
@@ -622,7 +691,6 @@ local function sample()
 			d.hidden = (hid == true) or d.revealed
 			d.color = d.edict and GOLD or WHITE
 
-			local char = p.Character
 			if char ~= d.char then
 				d.char = char
 				d.aliases, d.aliasTries = {}, 0
@@ -648,6 +716,11 @@ local function sample()
 			local okD, dn = pcall(function() return p.DisplayName end)
 			if okD and type(dn) == "string" then add(dn) end
 			d.full = formatName(d.first, d.uber, d.last, d.rank, d.gender)   -- cached for the overlay rows
+			if d.full == "" then
+				-- no character-name data found: show the display name / username instead of ???
+				if char then dumpOnce(p, char) end
+				if okD and type(dn) == "string" and dn ~= "" then d.full = dn else d.full = tostring(p.Name) end
+			end
 			add(d.full)
 			add(formatName(d.first, nil, d.last, d.rank, d.gender))
 			add(formatName(d.first, nil, d.last, nil, d.gender))
@@ -1759,12 +1832,12 @@ local function drawRow(i, d, x, y, refresh)
 	if refresh then
 		local nm = d.full or ""
 		local pre = (d.prestige and d.prestige > 0) and ("#" .. d.prestige .. " ") or ""
-		setTxt(t, string.format("%s%s%s%s (%s)",
+		setTxt(t, string.format("%s%s%s%s%s",
 			(Spectating == p) and "> " or "",
 			d.hidden and "[H] " or "",
 			pre,
 			(nm ~= "" and nm or "???"),
-			p.Name))
+			(nm ~= p.Name) and (" (" .. p.Name .. ")") or ""))
 		-- priority: spectated (light blue) > NOT spawned in (grey) > edict (gold) > white
 		local col = d.color or WHITE
 		if not d.spawned then col = GREY end
@@ -1997,3 +2070,14 @@ task.spawn(function()
 		pcall(wait, 0.25)
 	end
 end)
+
+end)   -- end of main pcall
+
+-- if anything in the main body errored, shut down whatever loops did start, then log it
+if not mainOk then
+	pcall(function() RL_GEN = (RL_GEN or 0) + 1 end)
+	pcall(function() SP_GEN = (SP_GEN or 0) + 1 end)
+	pcall(print, "[RogueLineage] script error: " .. tostring(mainErr))
+end
+
+end   -- end of PLACE_OK
