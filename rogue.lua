@@ -15,7 +15,10 @@
 --==============================================================
 -- PLACE GATE (first thing in the script)
 --==============================================================
-local ALLOWED_PLACES = { [5208655184] = true, [3541987450] = true }
+local ALLOWED_PLACES = {
+	[5208655184] = true, -- Gaia
+	[3541987450] = true, -- Khei
+}
 local PLACE_OK = false
 do
 	local okP, pid = pcall(function() return game.PlaceId end)
@@ -290,7 +293,7 @@ local GAME_CAM_MAX_DIST = 100
 local ROW_H, PANEL_W = 18, 430
 local RESET_WINDOW = 3
 local OVERLAY_X, OVERLAY_Y = 20, 200      -- starting position (drag the header to move it)
-local REVEAL_HIDDEN = false               -- true = unhide hidden players while in the menu
+local REVEAL_HIDDEN = true                -- always on: unhide hidden players while in the menu (put back on spawn / when stopped)
 local MENU_METHOD   = "cf"                -- "cf" = CFrame follow, "subj" = CameraSubject
 local FOLLOW_DIST   = 12                  -- starting menu follow distance
 local MIN_DIST, MAX_DIST = 0, 200         -- 0 = camera sits right inside the character
@@ -538,6 +541,7 @@ local function formatName(first, uber, last, rank, gender)
 		if rank == "Owner" then
 			title = (gender == "Female") and "Lady" or "Lord"
 			if first == "Ratriel" then title = "Pontiff" end
+			if first == "Justinian" or first == " Undying Justinian " then title = "Emperor" end
 		end
 		local parts = {}
 		if title ~= "" then parts[#parts + 1] = title end
@@ -615,6 +619,13 @@ end
 local function nameAttr(p, char, key)
 	local v = attr(p, key)
 	if v ~= nil and v ~= "" then return v end
+	-- Khei: Player.leaderstats.<key> value objects (StringValue / BoolValue / IntValue)
+	local okL, lv = pcall(function()
+		local ls = p:FindFirstChild("leaderstats")
+		local o = ls and ls:FindFirstChild(key)
+		if o then return o.Value end
+	end)
+	if okL and lv ~= nil and lv ~= "" then return lv end
 	if char then
 		local okC, c = pcall(function() return char:GetAttribute(key) end)
 		if okC and c ~= nil and c ~= "" then return c end
@@ -660,6 +671,18 @@ local function dumpOnce(p, char)
 	end)
 end
 
+-- sets "Hidden" wherever this map keeps it: Gaia = Player attribute, Khei = Player.leaderstats.Hidden value
+local function setHidden(p, val)
+	pcall(function()
+		if p:GetAttribute("Hidden") ~= nil then p:SetAttribute("Hidden", val) end
+	end)
+	pcall(function()
+		local ls = p:FindFirstChild("leaderstats")
+		local o = ls and ls:FindFirstChild("Hidden")
+		if o then o.Value = val end
+	end)
+end
+
 local function sample()
 	local reveal = REVEAL_HIDDEN == true and inMenu
 	local seen, nm = {}, {}
@@ -678,14 +701,14 @@ local function sample()
 			d.rank, d.gender = nameAttr(p, char, "HouseRank"), nameAttr(p, char, "Gender")
 			d.prestige, d.edict = nameAttr(p, char, "Prestige"), nameAttr(p, char, "MaxEdict")
 
-			local hid = attr(p, "Hidden")
+			local hid = nameAttr(p, char, "Hidden")
 			if reveal and p ~= LocalPlayer then
 				if hid == true then
 					d.revealed = true
-					pcall(function() p:SetAttribute("Hidden", false) end)
+					setHidden(p, false)
 				end
 			elseif d.revealed then
-				pcall(function() p:SetAttribute("Hidden", true) end)
+				setHidden(p, true)
 				d.revealed = false
 			end
 			d.hidden = (hid == true) or d.revealed
@@ -1621,6 +1644,14 @@ local function cleanup()
 		for p, t in pairs(Rows) do pcall(function() t:Remove() end) Rows[p] = nil end
 	end)
 	pcall(restoreLeaderboard)
+	pcall(function()
+		for p, d in pairs(Data) do
+			if d.revealed then
+				setHidden(p, true)
+				d.revealed = false
+			end
+		end
+	end)
 end
 
 local prev1, prev2, prevH = false, false, false
