@@ -282,8 +282,11 @@ local LOOK_SENS     = 0.0065              -- radians per pixel (raise = faster t
 local KEY_TURN      = 2.4                 -- Left/Right/Up/Down arrows, radians per second
 local KEY_ZOOM      = 1.4                 -- I/O, PageUp/PageDown, =/-  (zoom factor per second)
 local WHEEL_ZOOM    = 0.85                -- distance multiplier per wheel notch
-local ZOOM_SMOOTH   = 14                  -- higher = snappier zoom
+local ZOOM_SMOOTH   = 14                  -- higher = snappier zoom (0 = instant)
 local MOUSE_RECENTER = true               -- warps the cursor to screen centre if you drag into an edge
+local LOOK_SMOOTH   = 40                  -- how fast the shown camera angle catches up to your mouse (higher = tighter, 0 = raw / no smoothing)
+local ZOOM_DRAG     = 0.006               -- middle-mouse drag zoom, per pixel (drag down = out, up = in)
+local KEY_POLL      = 0.03                -- seconds between keyboard reads for the orbit keys (state is reused in between)
 
 -- flicker vs lag: each extra writer fights the game's camera harder but costs speed
 local DRIVER_THREADS = 1                  -- tight-loop camera writers (RenderStepped + Heartbeat also write)
@@ -437,9 +440,12 @@ local uiHidden = false
 local ovX, ovY = OVERLAY_X, OVERLAY_Y
 local dragging, dragOX, dragOY = false, 0, 0
 
--- menu orbit camera state
+-- menu orbit camera state (camYaw/camPitch/camDistTarget = where your input points; disp/camDist = what is shown)
 local camYaw, camPitch, camDist, camDistTarget = 0, 0.3, FOLLOW_DIST, FOLLOW_DIST
 local wheelAcc = 0
+local disp = { yaw = 0, pitch = 0.3, t = 0 }   -- the angles the camera actually shows (eased toward camYaw/camPitch)
+local interactAt = 0                       -- last time you orbited/zoomed: background scans pause while this is recent
+local dragTick                             -- defined further down (lets the extra writers move the overlay too)
 
 -- per-frame input snapshot
 local inp = { active = false, m1 = false, m2 = false }
@@ -670,7 +676,8 @@ end
 task.spawn(function()
 	while alive() do
 		pcall(function()
-			if not dragging and not checkSession() then pcall(sample) end
+			-- skipped while dragging the overlay or orbiting/zooming: these scans are what makes the camera hitch
+			if not dragging and (tick() - interactAt) > 0.3 and not checkSession() then pcall(sample) end
 		end)
 		pcall(wait, 1.0)
 	end
@@ -906,6 +913,7 @@ local function startSpectating(player)
 				camTypeOrig, camTypeWritten = nil, nil
 				setCamType(ca, CAM_SCRIPTABLE)
 				camYaw, camPitch, camDist, camDistTarget = 0, 0.3, FOLLOW_DIST, FOLLOW_DIST
+				disp.yaw, disp.pitch, disp.t = 0, 0.3, tick()
 				wheelAcc = 0
 			end
 			overriding = true
@@ -977,7 +985,9 @@ end
 
 --==============================================================
 -- MENU CFRAME FOLLOW (orbit camera) — kept as lean as possible
--- Orbit angles are changed only in updateOrbit(); this just applies them.
+-- Your input only changes camYaw/camPitch/camDistTarget (in updateOrbit). Every writer that calls this
+-- eases the SHOWN angles toward them by real elapsed time, so the motion is continuous at whatever rate
+-- the writers run, instead of stepping once per input frame.
 --==============================================================
 local cfTick
 do
@@ -1020,14 +1030,25 @@ local function cfFollow()
 	local ok, tx, ty, tz = pcall(readTarget)
 	if not ok or type(tx) ~= "number" then return end
 
+	-- ease the shown angles / zoom toward the input targets by the time since the last call (any writer)
+	local now = tick()
+	local dt = now - disp.t
+	disp.t = now
+	if dt > 0.1 then dt = 0.1 elseif dt < 0 then dt = 0 end
+	local kl = (LOOK_SMOOTH > 0) and (1 - 2.718281828 ^ (-LOOK_SMOOTH * dt)) or 1
+	local kz = (ZOOM_SMOOTH > 0) and (1 - 2.718281828 ^ (-ZOOM_SMOOTH * dt)) or 1
+	disp.yaw = disp.yaw + (camYaw - disp.yaw) * kl
+	disp.pitch = disp.pitch + (camPitch - disp.pitch) * kl
+	camDist = camDist + (camDistTarget - camDist) * kz
+
 	cfCalls = cfCalls + 1
 	if offs.camtype and cfCalls % 15 == 0 then pcall(enforceScriptable) end
 
 	local fx, fy, fz = tx, ty + 1.5, tz
-	local cp = cos(camPitch)
-	local px = fx + camDist * sin(camYaw) * cp
-	local py = fy + camDist * sin(camPitch)
-	local pz = fz + camDist * cos(camYaw) * cp
+	local cp = cos(disp.pitch)
+	local px = fx + camDist * sin(disp.yaw) * cp
+	local py = fy + camDist * sin(disp.pitch)
+	local pz = fz + camDist * cos(disp.yaw) * cp
 
 	if not cfPropBad and camObj then
 		if pcall(writeCamProp, px, py, pz, fx, fy, fz) then
@@ -1046,12 +1067,12 @@ function cfTick()
 end
 end
 
--- extra tight-loop writers
+-- extra tight-loop writers (they also move the overlay while it is being dragged)
 for _ = 1, DRIVER_THREADS do
 	pcall(function()
 		task.spawn(function()
 			while alive() do
-				if not dragging then pcall(cfTick) end
+				if dragging then pcall(dragTick) else pcall(cfTick) end
 				pcall(wait)
 			end
 		end)
@@ -1423,7 +1444,8 @@ local function stateTick()
 		pcall(runeTick)
 		pcall(followCheck, now)
 	end
-	if not dragging then pcall(tintTick, now) end
+	-- leaderboard tinting is skipped while dragging / orbiting / zooming (it is the heavy part of this tick)
+	if not dragging and (now - interactAt) > 0.3 then pcall(tintTick, now) end
 end
 
 task.spawn(function()
@@ -1556,14 +1578,29 @@ local function handleClicks()
 end
 
 -- Menu orbit camera, modelled on the default Roblox camera:
---   hold RIGHT MOUSE + drag = rotate, mouse wheel (or I / O, PageUp / PageDown, = / -) = zoom,
---   arrow keys also rotate.
+--   hold RIGHT MOUSE + drag = rotate, arrow keys also rotate.
+--   zoom = mouse wheel, or I / O, PageUp / PageDown, = / -, or hold MIDDLE MOUSE + drag up/down.
+-- This only reads input and moves the TARGETS (camYaw / camPitch / camDistTarget); cfFollow eases the shown camera toward them.
 local updateOrbit
 do
 local lastOrbitT, rmbWas, lastMX, lastMY = tick(), false, nil, nil
 local vpW, vpH, vpAt = nil, nil, 0
+local deltaFails = 0                       -- GetMouseDelta errors; after a few we stop calling it every frame
+local keys, keysAt = { l = false, r = false, u = false, d = false, zi = false, zo = false }, 0
 local function readVP() local v = workspace.CurrentCamera.ViewportSize; return v.X, v.Y end
 local function getMouseDelta() return UserInputService:GetMouseDelta() end
+
+-- the orbit keys are read every KEY_POLL seconds and the state reused in between (the camera still moves every frame, by dt)
+local function pollKeys(now)
+	if now - keysAt < KEY_POLL then return end
+	keysAt = now
+	keys.l  = keyDown(0x25)                                            -- Left
+	keys.r  = keyDown(0x27)                                            -- Right
+	keys.u  = keyDown(0x26)                                            -- Up
+	keys.d  = keyDown(0x28)                                            -- Down
+	keys.zi = keyDown(0x49) or keyDown(0x21) or keyDown(0xBB)          -- I / PageUp / =
+	keys.zo = keyDown(0x4F) or keyDown(0x22) or keyDown(0xBD)          -- O / PageDown / -
+end
 
 function updateOrbit()
 	local now = tick()
@@ -1576,14 +1613,23 @@ function updateOrbit()
 		return
 	end
 
-	-- mouse look
-	if inp.m2 and not dragging then
+	local look = inp.m2 and not dragging
+	local zdrag = (not look) and (not dragging) and keyDown(0x04)    -- middle mouse held: drag up/down to zoom
+
+	-- mouse look / middle-mouse zoom
+	if look or zdrag then
+		interactAt = now
 		local mx, my = mousePos()
 		local dx, dy
-		local okD, md = pcall(getMouseDelta)
-		if okD and md and (md.X ~= 0 or md.Y ~= 0) then
-			dx, dy = md.X, md.Y
-		elseif rmbWas and mx and lastMX then
+		if deltaFails < 8 then
+			local okD, md = pcall(getMouseDelta)
+			if not okD then
+				deltaFails = deltaFails + 1
+			elseif md and (md.X ~= 0 or md.Y ~= 0) then
+				dx, dy = md.X, md.Y
+			end
+		end
+		if not dx and rmbWas and mx and lastMX then
 			dx, dy = mx - lastMX, my - lastMY
 		end
 		lastMX, lastMY = mx, my
@@ -1603,33 +1649,34 @@ function updateOrbit()
 		end
 
 		if dx then
-			camYaw = camYaw - dx * LOOK_SENS
-			camPitch = clamp(camPitch + dy * LOOK_SENS, -1.2, 1.4)
+			if look then
+				camYaw = camYaw - dx * LOOK_SENS
+				camPitch = clamp(camPitch + dy * LOOK_SENS, -1.2, 1.4)
+			else
+				camDistTarget = clamp(camDistTarget * (2.718281828 ^ (dy * ZOOM_DRAG)), MIN_DIST, MAX_DIST)
+			end
 		end
 	else
 		rmbWas, lastMX, lastMY = false, nil, nil
 	end
 
 	-- arrow keys
-	if keyDown(0x25) then camYaw = camYaw + KEY_TURN * dt end                              -- Left
-	if keyDown(0x27) then camYaw = camYaw - KEY_TURN * dt end                              -- Right
-	if keyDown(0x26) then camPitch = clamp(camPitch - KEY_TURN * 0.7 * dt, -1.2, 1.4) end  -- Up
-	if keyDown(0x28) then camPitch = clamp(camPitch + KEY_TURN * 0.7 * dt, -1.2, 1.4) end  -- Down
+	pollKeys(now)
+	if keys.l then camYaw = camYaw + KEY_TURN * dt end
+	if keys.r then camYaw = camYaw - KEY_TURN * dt end
+	if keys.u then camPitch = clamp(camPitch - KEY_TURN * 0.7 * dt, -1.2, 1.4) end
+	if keys.d then camPitch = clamp(camPitch + KEY_TURN * 0.7 * dt, -1.2, 1.4) end
 
-	-- zoom: wheel notches + keys, smoothed
+	-- zoom: wheel notches + keys (cfFollow smooths the distance)
 	if wheelAcc ~= 0 then
 		camDistTarget = clamp(camDistTarget * (WHEEL_ZOOM ^ wheelAcc), MIN_DIST, MAX_DIST)
 		wheelAcc = 0
+		interactAt = now
 	end
-	if keyDown(0x49) or keyDown(0x21) or keyDown(0xBB) then   -- I / PageUp / =
-		camDistTarget = clamp(camDistTarget / (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST)
-	end
-	if keyDown(0x4F) or keyDown(0x22) or keyDown(0xBD) then   -- O / PageDown / -
-		camDistTarget = clamp(camDistTarget * (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST)
-	end
-	local k = ZOOM_SMOOTH * dt
-	if k > 1 then k = 1 end
-	camDist = camDist + (camDistTarget - camDist) * k
+	if keys.zi then camDistTarget = clamp(camDistTarget / (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST) end
+	if keys.zo then camDistTarget = clamp(camDistTarget * (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST) end
+
+	if keys.l or keys.r or keys.u or keys.d or keys.zi or keys.zo then interactAt = now end
 end
 end
 
@@ -1716,6 +1763,14 @@ function drawOverlay()
 end
 end
 
+-- same as updateDrag, but reads the mouse button itself: lets the Heartbeat / driver writers move the overlay too
+function dragTick()
+	if not dragging then return end
+	local ok1, d1 = pcall(ismouse1pressed)
+	inp.m1 = ok1 and d1 == true
+	updateDrag()
+end
+
 local function frame()
 	pcall(pollInput)
 	pcall(updateDrag)         -- move the overlay first, right after reading the mouse
@@ -1723,7 +1778,7 @@ local function frame()
 	pcall(updateOrbit)        -- input first ...
 	pcall(cfTick)             -- ... then apply it immediately (writer #1)
 	pcall(handleClicks)
-	pcall(drawOverlay)
+	if not dragging then pcall(drawOverlay) end   -- while dragging, updateDrag already moves everything
 end
 
 local conns = {}
@@ -1751,7 +1806,7 @@ end)
 -- writer #2
 pcall(function()
 	conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-		if not dragging then pcall(cfTick) end
+		if dragging then pcall(dragTick) else pcall(cfTick) end
 	end)
 end)
 
@@ -1768,14 +1823,29 @@ pcall(function()
 	end)
 end)
 
+-- wheel zoom: whichever source delivers a wheel event first is used from then on, so a notch is never counted twice
+local wheelSrc = nil
+local function addWheel(src, z)
+	if type(z) ~= "number" or z == 0 then return end
+	if wheelSrc == nil then wheelSrc = src end
+	if wheelSrc == src then wheelAcc = wheelAcc + z end
+end
+
 pcall(function()
 	conns[#conns + 1] = UserInputService.InputChanged:Connect(function(input)
 		pcall(function()
 			if input.UserInputType == Enum.UserInputType.MouseWheel then
-				wheelAcc = wheelAcc + (input.Position.Z or 0)
+				addWheel("uis", input.Position.Z or 0)
 			end
 		end)
 	end)
+end)
+
+-- fallback wheel source: the Mouse object's own wheel events (some executors only deliver the wheel there)
+pcall(function()
+	local m = LocalPlayer:GetMouse()
+	conns[#conns + 1] = m.WheelForward:Connect(function() pcall(addWheel, "mouse", 1) end)
+	conns[#conns + 1] = m.WheelBackward:Connect(function() pcall(addWheel, "mouse", -1) end)
 end)
 
 pcall(notify, "Loaded. The player list appears in the main menu.", "Spectate", 4)
