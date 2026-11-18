@@ -1,6 +1,251 @@
---// Spectate (menu player list) — Matcha port (v13)
---// v13: fixes "Out of local registers" (Lua 5.1 allows max 200 locals per function): sections are
---//      now scoped in do-blocks so they stop counting once finished. No behaviour changes vs v12.
+--// Rogue Lineage — Matcha
+--//   * Spectate (menu player list) — Matcha port (v13), unchanged apart from being start/stop-able
+--//   * "Rogue Lineage" Matcha tab: Spectate on/off toggle + named configs (one JSON file each in
+--//     RogueLineage/configs/, pick which one to load; the last one used is autoloaded at start)
+--//
+--// Locals: the main chunk only has `RL`. Everything else lives on the RL table, and the spectate body
+--// keeps its own do-blocks (v13) so it stays well under Lua 5.1's 200-locals-per-function limit.
+--//
+--// ADDING A FEATURE LATER: add one row to RL.items (id = the UI widget id, key = the name in the JSON,
+--// default = value used when the config has nothing). Save/Load/autoload then handle it automatically.
+
+local RL = {
+	dir     = "RogueLineage",
+	cfgDir  = "RogueLineage/configs",        -- one JSON file per named config
+	legacy  = "RogueLineage/config.json",    -- old single-file config, still read as "default"
+	lastFile = "RogueLineage/last.txt",      -- remembers which config to autoload
+	name    = "default",                     -- currently selected config
+	nameId  = "rl_cfg_name",
+	comboId = "rl_cfg_pick",
+	indexFile = "RogueLineage/index.txt",    -- names of saved configs (so listing never depends on listfiles)
+	base    = 0,                             -- dropdown index base: 0 = first item is 0. If the wrong config loads, set 1.
+	pick    = 1,                             -- selected position in RL.list (always 1-based here)
+	list    = {},
+	none    = { "(none saved yet)" },
+	listAt  = 0,
+	specId  = "rl_spectate",
+	running = false,
+	ready   = false,
+	cfg     = {},
+	items   = {
+		{ id = "rl_spectate", key = "spectate", default = true },
+	},
+}
+
+RL_GEN = (RL_GEN or 0) + 1
+RL.gen = RL_GEN
+
+--==============================================================
+-- CONFIG (flat JSON: booleans, numbers, simple strings)
+--==============================================================
+function RL.encode(t)
+	local keys = {}
+	for k in pairs(t) do keys[#keys + 1] = k end
+	table.sort(keys)
+	local out = {}
+	for _, k in ipairs(keys) do
+		local v = t[k]
+		local s
+		if type(v) == "string" then
+			s = '"' .. (string.gsub(v, '[\\"]', '\\%0')) .. '"'
+		elseif type(v) == "boolean" or type(v) == "number" then
+			s = tostring(v)
+		end
+		if s then out[#out + 1] = '"' .. tostring(k) .. '":' .. s end
+	end
+	return "{" .. table.concat(out, ",") .. "}"
+end
+
+function RL.decode(body)
+	local t = {}
+	for k, v in string.gmatch(body, '"([^"]+)"%s*:%s*"([^"]*)"') do t[k] = v end
+	for k, v in string.gmatch(body, '"([^"]+)"%s*:%s*([^,}%s"]+)') do
+		if v == "true" then t[k] = true
+		elseif v == "false" then t[k] = false
+		elseif tonumber(v) then t[k] = tonumber(v) end
+	end
+	return t
+end
+
+function RL.read(name)
+	local ok, body = pcall(function()
+		local path = RL.cfgDir .. "/" .. name .. ".json"
+		if isfile(path) then return readfile(path) end
+		if name == "default" and isfile(RL.legacy) then return readfile(RL.legacy) end
+	end)
+	if ok and type(body) == "string" and body ~= "" then
+		local ok2, t = pcall(RL.decode, body)
+		if ok2 and type(t) == "table" then return t, true end
+	end
+	return {}, false
+end
+
+function RL.write(name, t)
+	return pcall(function()
+		if not isfolder(RL.dir) then makefolder(RL.dir) end
+		if not isfolder(RL.cfgDir) then makefolder(RL.cfgDir) end
+		writefile(RL.cfgDir .. "/" .. name .. ".json", RL.encode(t))
+	end)
+end
+
+-- config names: letters, digits, _ and - only (spaces become _), max 32 chars
+function RL.clean(s)
+	s = tostring(s or "")
+	s = string.gsub(s, "%s+", "_")
+	s = string.gsub(s, "[^%w_%-]", "")
+	if s == "" then s = "default" end
+	return string.sub(s, 1, 32)
+end
+
+function RL.setLast(name)
+	pcall(function()
+		if not isfolder(RL.dir) then makefolder(RL.dir) end
+		writefile(RL.lastFile, name)
+	end)
+end
+
+function RL.getLast()
+	local ok, v = pcall(function()
+		if isfile(RL.lastFile) then return readfile(RL.lastFile) end
+	end)
+	if ok and type(v) == "string" and v ~= "" then return RL.clean(v) end
+	return nil
+end
+
+function RL.exists(name)
+	local ok, r = pcall(function()
+		return isfile(RL.cfgDir .. "/" .. name .. ".json") or (name == "default" and isfile(RL.legacy))
+	end)
+	return ok and r == true
+end
+
+function RL.readIndex()
+	local names = {}
+	pcall(function()
+		if isfile(RL.indexFile) then
+			for n in string.gmatch(readfile(RL.indexFile), "[^\r\n]+") do names[#names + 1] = n end
+		end
+	end)
+	return names
+end
+
+function RL.addIndex(name)
+	local names = RL.readIndex()
+	for _, n in ipairs(names) do
+		if n == name then return end
+	end
+	names[#names + 1] = name
+	pcall(function()
+		if not isfolder(RL.dir) then makefolder(RL.dir) end
+		writefile(RL.indexFile, table.concat(names, "\n"))
+	end)
+end
+
+-- rebuild the list of saved configs: the index file, plus anything listfiles can see, only if the file exists
+function RL.refresh()
+	local seen, names = {}, {}
+	local function add(n)
+		if n and n ~= "" and not seen[n] and RL.exists(n) then
+			seen[n] = true
+			names[#names + 1] = n
+		end
+	end
+	for _, n in ipairs(RL.readIndex()) do add(n) end
+	pcall(function()
+		if isfolder(RL.cfgDir) then
+			for _, p in ipairs(listfiles(RL.cfgDir)) do
+				add(string.match(tostring(p), "([^/\\]+)%.json$"))
+			end
+		end
+	end)
+	add("default")
+	table.sort(names)
+	RL.list = names
+	RL.listAt = tick()
+	if RL.pick > #names or RL.pick < 1 then RL.pick = 1 end
+end
+
+-- point the dropdown at a config
+function RL.select(name)
+	for i, n in ipairs(RL.list) do
+		if n == name then
+			RL.pick = i
+			pcall(UI.SetValue, RL.comboId, i - 1 + RL.base)
+			return
+		end
+	end
+end
+
+function RL.autoName()
+	local used = {}
+	for _, n in ipairs(RL.list) do used[n] = true end
+	local i = 1
+	while used["config_" .. i] do i = i + 1 end
+	return "config_" .. i
+end
+
+-- value for a config key: the saved one if it has the right type, otherwise the item's default
+function RL.val(key)
+	for _, it in ipairs(RL.items) do
+		if it.key == key then
+			local v = RL.cfg[key]
+			if type(v) == type(it.default) then return v end
+			return it.default
+		end
+	end
+end
+
+function RL.save(name)
+	name = RL.clean(name)
+	local t = {}
+	for _, it in ipairs(RL.items) do
+		local ok, v = pcall(UI.GetValue, it.id)
+		if ok and type(v) == type(it.default) then t[it.key] = v else t[it.key] = RL.val(it.key) end
+	end
+	RL.cfg = t
+	local ok = RL.write(name, t)
+	ok = ok and RL.exists(name)   -- make sure the file really was created
+	if ok then
+		RL.name = name
+		RL.setLast(name)
+		RL.addIndex(name)
+		RL.refresh()
+		RL.select(name)
+	end
+	return ok
+end
+
+function RL.load(name)
+	name = RL.clean(name)
+	local t, found = RL.read(name)
+	if not found then return false end
+	RL.cfg = t
+	RL.name = name
+	RL.setLast(name)
+	for _, it in ipairs(RL.items) do pcall(UI.SetValue, it.id, RL.val(it.key)) end
+	RL.select(name)
+	return true
+end
+
+--==============================================================
+-- SPECTATE ON/OFF
+--==============================================================
+function RL.stopSpectate()
+	-- bumping the generation makes the running copy clean itself up (camera, leaderboard, overlay) and exit
+	pcall(function() SP_GEN = (SP_GEN or 0) + 1 end)
+end
+
+function RL.apply(on)
+	on = (on == true)
+	if on == RL.running then return end
+	RL.running = on
+	if on then RL.startSpectate() else RL.stopSpectate() end
+end
+
+--==============================================================
+-- SPECTATE (original script body)
+--==============================================================
+function RL.startSpectate()
 local ranOk = pcall(function()
 
 SP_GEN = (SP_GEN or 0) + 1
@@ -42,11 +287,6 @@ local MOUSE_RECENTER = true               -- warps the cursor to screen centre i
 
 -- flicker vs lag: each extra writer fights the game's camera harder but costs speed
 local DRIVER_THREADS = 1                  -- tight-loop camera writers (RenderStepped + Heartbeat also write)
-
--- menu camera script (see notes in the reply). Names must match EXACTLY what the console prints.
-local PRINT_SCRIPT_CANDIDATES = true      -- prints scripts that look camera/menu related, once, on load
-local CAM_KEYWORDS = { "camera", "cam", "menu", "spawn", "title", "lobby", "select", "intro" }
-local DISABLE_MENU_SCRIPTS = {}           -- e.g. { "MenuCamera" }  (disabled while spectating from the menu)
 
 local LBLUE = Color3.fromRGB(120, 200, 255)   -- spectated player
 local GREY  = Color3.fromRGB(130, 130, 130)   -- NOT spawned in
@@ -182,11 +422,9 @@ local Spectating, specHumAddr, specBadSince, specHrp = nil, nil, nil, nil
 local specMode = nil                       -- "subj" (CameraSubject) or "cf" (CFrame follow)
 local overriding, origSubject, origIsOwn = false, nil, false
 local camTypeOrig, camTypeWritten, camCheckAt = nil, nil, nil
-local dirty = false
 local resetUntil = 0
 local inMenu = false
-local SpecStatus = "idle"
-local cfPropBad, cfErrCount, cfState = false, 0, "-"
+local cfPropBad, cfErrCount = false, 0
 local camAddr, camObj = nil, nil
 
 -- overlay UI state
@@ -209,7 +447,6 @@ local nameMap = {}
 --==============================================================
 local offs = { subj = DEFAULTS.subj, camtype = DEFAULTS.camtype, campos = DEFAULTS.campos,
 	camrot = DEFAULTS.camrot, io = DEFAULTS.io, mpos = DEFAULTS.mpos }
-local OffInfo = { version = "built-in", dumped = "?", source = "built-in", status = "not checked" }
 local offsetTrusted, camTypeBad, camTypeVerified = false, false, nil
 
 pcall(function()
@@ -225,7 +462,7 @@ local function parseOffset(body, block, key)
 	return ok and r or nil
 end
 
-local function applyBody(body, source)
+local function applyBody(body)
 	local ok, res = pcall(function()
 		local s = parseOffset(body, "Camera", "CameraSubject")
 		if not s or s < 16 or s > 1024 then return false end
@@ -244,9 +481,6 @@ local function applyBody(body, source)
 		if changed and Spectating then pcall(stopSpectating) end
 		for k, v in pairs(n) do offs[k] = v end
 		if changed then offsetTrusted, camTypeBad = false, false end
-		OffInfo.version = string.match(body, '"Roblox Version"%s*:%s*"([^"]+)"') or "?"
-		OffInfo.dumped  = string.match(body, '"Dumped At"%s*:%s*"([^"]+)"') or "?"
-		OffInfo.source  = source
 		return true
 	end)
 	return ok and res == true
@@ -254,21 +488,14 @@ end
 
 local function refreshOffsets()
 	pcall(function()
-		OffInfo.status = "fetching..."
+		-- live offsets first, then the cached copy, otherwise the built-in DEFAULTS
 		local ok, body = pcall(httpget, OFFSETS_URL)
-		if ok and type(body) == "string" and body:find('"Offsets"') then
-			if applyBody(body, "live") then
-				pcall(writefile, CACHE_FILE, body)
-				OffInfo.status = "updated on script run"
-				return
-			end
-		end
-		local okc, cached = pcall(function() if isfile(CACHE_FILE) then return readfile(CACHE_FILE) end end)
-		if okc and type(cached) == "string" and applyBody(cached, "cache") then
-			OffInfo.status = "fetch failed - using cache"
+		if ok and type(body) == "string" and body:find('"Offsets"') and applyBody(body) then
+			pcall(writefile, CACHE_FILE, body)
 			return
 		end
-		OffInfo.status = "fetch failed - using built-in"
+		local okc, cached = pcall(function() if isfile(CACHE_FILE) then return readfile(CACHE_FILE) end end)
+		if okc and type(cached) == "string" then applyBody(cached) end
 	end)
 end
 
@@ -354,89 +581,6 @@ end
 end
 
 --==============================================================
--- MENU CAMERA SCRIPT: finder + disabler
---==============================================================
-local disableMenuScripts, restoreMenuScripts
-do
-local function readName(i) return i.Name end
-local function readParent(i) return i.Parent end
-local function readDisabled(s) return s.Disabled end
-local function writeDisabled(s, v) s.Disabled = v end
-local function pathOf(inst)
-	local parts, cur = {}, inst
-	for _ = 1, 14 do
-		if not cur then break end
-		local ok, nm = pcall(readName, cur)
-		if not ok then break end
-		table.insert(parts, 1, tostring(nm))
-		local okP, par = pcall(readParent, cur)
-		if not okP then break end
-		cur = par
-	end
-	return table.concat(parts, ".")
-end
-
-local function printScriptCandidates()
-	pcall(function()
-		local ok, scripts = pcall(getscripts)
-		if not ok or type(scripts) ~= "table" then
-			pcall(print, "[SPEC] getscripts() failed - cannot list scripts")
-			return
-		end
-		pcall(print, "[SPEC] ---- camera/menu-looking scripts (put the exact Name in DISABLE_MENU_SCRIPTS) ----")
-		local shown = 0
-		for _, s in ipairs(scripts) do
-			if shown >= 80 then break end
-			pcall(function()
-				local nm = lower(tostring(s.Name))
-				for _, k in ipairs(CAM_KEYWORDS) do
-					if find(nm, k, 1, true) then
-						local cn = ""
-						pcall(function() cn = s.ClassName end)
-						pcall(print, string.format("[SPEC]  Name=%s  Class=%s  Path=%s", tostring(s.Name), cn, pathOf(s)))
-						shown = shown + 1
-						break
-					end
-				end
-			end)
-		end
-		pcall(print, "[SPEC] ---- " .. shown .. " listed ----")
-	end)
-end
-
-local disabledScripts = {}
-function disableMenuScripts()
-	pcall(function()
-		if #DISABLE_MENU_SCRIPTS == 0 or next(disabledScripts) ~= nil then return end
-		local set = {}
-		for _, n in ipairs(DISABLE_MENU_SCRIPTS) do set[n] = true end
-		local ok, scripts = pcall(getscripts)
-		if not ok or type(scripts) ~= "table" then return end
-		for _, s in ipairs(scripts) do
-			local okN, nm = pcall(readName, s)
-			if okN and set[nm] then
-				local okD, prev = pcall(readDisabled, s)
-				if pcall(writeDisabled, s, true) then
-					disabledScripts[s] = (okD and prev) or false
-				end
-			end
-		end
-	end)
-end
-
-function restoreMenuScripts()
-	pcall(function()
-		for s, prev in pairs(disabledScripts) do
-			pcall(writeDisabled, s, prev)
-			disabledScripts[s] = nil
-		end
-	end)
-end
-
-if PRINT_SCRIPT_CANDIDATES then pcall(printScriptCandidates) end
-end
-
---==============================================================
 -- PLAYER SAMPLING (attributes + name map) — polling, no events
 --==============================================================
 local function sample()
@@ -494,7 +638,8 @@ local function sample()
 			add(p.Name)
 			local okD, dn = pcall(function() return p.DisplayName end)
 			if okD and type(dn) == "string" then add(dn) end
-			add(formatName(d.first, d.uber, d.last, d.rank, d.gender))
+			d.full = formatName(d.first, d.uber, d.last, d.rank, d.gender)   -- cached for the overlay rows
+			add(d.full)
 			add(formatName(d.first, nil, d.last, d.rank, d.gender))
 			add(formatName(d.first, nil, d.last, nil, d.gender))
 			if d.first and d.first ~= "" then add(d.first) end
@@ -667,22 +812,18 @@ stopSpectating = function(reason)
 			end
 		end
 		pcall(restoreCamType)
-		pcall(restoreMenuScripts)
 	end)
 	camCheckAt = nil
 	runeDecals = {}
 	Spectating, specHumAddr, specBadSince, specHrp, specMode = nil, nil, nil, nil, nil
-	cfState = "-"
-	SpecStatus = "idle"
 end
 
+-- runs on EVERY menu <-> spawned change: drop any spectate, put the camera back, and (on spawn)
+-- keep forcing the camera onto our own humanoid for RESET_WINDOW seconds (see resetTick)
 hardReset = function(kind)
 	pcall(function()
-		if not (dirty or overriding or Spectating) then return end
 		pcall(stopSpectating, kind)
-		dirty = false
 		if kind == "spawn" then resetUntil = tick() + RESET_WINDOW end
-		SpecStatus = "idle (camera reset)"
 	end)
 end
 
@@ -718,9 +859,8 @@ local function followCheck(now)
 		if not (okT and tp and cx) then return end
 		if (cx - tp.X) ^ 2 + (cy - tp.Y) ^ 2 + (cz - tp.Z) ^ 2 < GAME_CAM_MAX_DIST ^ 2 then
 			markCamTypeVerified()
-			SpecStatus = "following " .. (Spectating and Spectating.Name or "?")
 		elseif inMenu then
-			logOnce("Menu CameraSubject mode didn't follow - the menu camera script is overriding it (see DISABLE_MENU_SCRIPTS)")
+			logOnce("Menu CameraSubject mode didn't follow - the menu camera script is overriding it")
 			pcall(stopSpectating)
 		else
 			camTypeBad = true
@@ -740,8 +880,6 @@ local function startSpectating(player)
 		local mode = (inMenu and menuUsesCF()) and "cf" or "subj"
 		if overriding and specMode ~= mode then stopSpectating() end
 
-		if inMenu then disableMenuScripts() end
-
 		-- MENU: CFrame follow (CameraType becomes Scriptable, the subject is left alone)
 		if mode == "cf" then
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -754,9 +892,7 @@ local function startSpectating(player)
 			end
 			overriding = true
 			Spectating, specHumAddr, specBadSince, specHrp, specMode = player, nil, nil, hrp, "cf"
-			cfPropBad, cfErrCount, cfState = false, 0, "starting"
-			dirty = true
-			SpecStatus = "following " .. player.Name .. " (menu)"
+			cfPropBad, cfErrCount = false, 0
 			return true
 		end
 
@@ -790,10 +926,8 @@ local function startSpectating(player)
 		Spectating, specHumAddr, specBadSince, specMode = player, ha, nil, "subj"
 		specHrp = char:FindFirstChild("HumanoidRootPart")
 		if inMenu or (wrote and camTypeVerified ~= offs.camtype) then camCheckAt = tick() + 1.5 end
-		dirty = true
 		collectRunes(char)
 		collectRunes(LocalPlayer.Character)
-		SpecStatus = "spectating " .. player.Name
 		return true
 	end)
 	return ok and res == true
@@ -1277,7 +1411,6 @@ local function cleanup()
 		for p, t in pairs(Rows) do pcall(function() t:Remove() end) Rows[p] = nil end
 	end)
 	pcall(restoreLeaderboard)
-	pcall(restoreMenuScripts)
 end
 
 local prev1, prev2, prevH = false, false, false
@@ -1463,7 +1596,7 @@ local function drawRow(i, d, x, y, refresh)
 	if not t then t = newText(14, 2); Rows[p] = t; refresh = true end
 	if not t then return end
 	if refresh then
-		local nm = formatName(d.first, d.uber, d.last, d.rank, d.gender)
+		local nm = d.full or ""
 		local pre = (d.prestige and d.prestige > 0) and ("#" .. d.prestige .. " ") or ""
 		setTxt(t, string.format("%s%s%s%s (%s)",
 			(Spectating == p) and "> " or "",
@@ -1580,3 +1713,80 @@ end)
 if not ranOk then
 	pcall(function() SP_GEN = (SP_GEN or 0) + 1 end)
 end
+end
+
+--==============================================================
+-- MATCHA TAB: "Rogue Lineage"
+--==============================================================
+UI.AddTab("Rogue Lineage", function(tab)
+	if RL_GEN ~= RL.gen then return end   -- stale tab from an earlier run of this script
+
+	local sp = tab:Section("Spectate", "Left")
+	sp:Toggle(RL.specId, "Enable Spectate", RL.val("spectate"))
+
+	local cf = tab:Section("Config", "Right")
+	if tick() - RL.listAt > 3 then RL.refresh() end
+
+	cf:Text("Current config: " .. RL.name)
+
+	-- dropdown of saved configs + load the selected one
+	cf:Combo(RL.comboId, "Saved configs", (#RL.list > 0) and RL.list or RL.none, RL.base)
+	cf:Button("Load Selected Config", function()
+		local okC, v = pcall(UI.GetValue, RL.comboId)
+		local nm
+		if okC and type(v) == "number" then nm = RL.list[math.floor(v) - RL.base + 1] end
+		if nm and RL.load(nm) then
+			pcall(notify, "Loaded config '" .. nm .. "'.", "Rogue Lineage", 3)
+		else
+			pcall(notify, "No config selected to load.", "Rogue Lineage", 4)
+		end
+	end)
+
+	-- save under a new/typed name (blank = auto-named config_1, config_2, ...)
+	cf:Spacing()
+	cf:InputText(RL.nameId, "Save as", "")
+	cf:Button("Save Config", function()
+		RL.refresh()
+		local okN, v = pcall(UI.GetValue, RL.nameId)
+		local typed = (okN and type(v) == "string") and v or ""
+		local nm = string.match(typed, "%w") and RL.clean(typed) or RL.autoName()
+		if RL.save(nm) then
+			pcall(UI.SetValue, RL.nameId, "")
+			pcall(notify, "Saved config '" .. nm .. "'.", "Rogue Lineage", 3)
+		else
+			pcall(notify, "Save failed - the file was not created.", "Rogue Lineage", 5)
+		end
+	end)
+
+	-- first render: push the autoloaded values into the widgets, then let the watcher below act on them
+	if not RL.ready then
+		for _, it in ipairs(RL.items) do pcall(UI.SetValue, it.id, RL.val(it.key)) end
+		RL.select(RL.name)
+		RL.ready = true
+	end
+end)
+
+--==============================================================
+-- START: autoload config, apply it, and watch the toggle
+--==============================================================
+RL.name = RL.getLast() or "default"
+RL.cfg = RL.read(RL.name)
+RL.refresh()
+
+-- re-running the script: shut down any spectate copy left over from the previous run first
+RL.stopSpectate()
+
+task.spawn(function()
+	pcall(RL.apply, RL.val("spectate"))
+end)
+
+task.spawn(function()
+	while RL_GEN == RL.gen do
+		pcall(function()
+			if not RL.ready then return end
+			local v = UI.GetValue(RL.specId)
+			if type(v) == "boolean" then RL.apply(v) end
+		end)
+		pcall(wait, 0.25)
+	end
+end)
