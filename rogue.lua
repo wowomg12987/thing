@@ -1,7 +1,6 @@
---// Spectate (menu player list) — Matcha port (v12)
---// v12: performance rewrite (no more lag), in-game-style orbit camera with wheel zoom,
---//      grey = NOT spawned in (overlay + real leaderboard), reliable H toggle,
---//      menu-camera-script finder/disabler. Everything pcall-wrapped.
+--// Spectate (menu player list) — Matcha port (v13)
+--// v13: fixes "Out of local registers" (Lua 5.1 allows max 200 locals per function): sections are
+--//      now scoped in do-blocks so they stop counting once finished. No behaviour changes vs v12.
 local ranOk = pcall(function()
 
 SP_GEN = (SP_GEN or 0) + 1
@@ -108,47 +107,40 @@ local function clamp(v, lo, hi)
 	return v
 end
 
--- tiny static accessors (no closure allocation in hot paths)
-local function readText(d) return d.Text end
-local function readTextColor(d) return d.TextColor3 end
-local function writeTextColor(d, c) d.TextColor3 = c end
-local function getDesc(r) return r:GetDescendants() end
-local function readName(i) return i.Name end
-local function readParent(i) return i.Parent end
-local function readDisabled(s) return s.Disabled end
-local function writeDisabled(s, v) s.Disabled = v end
-
 -- Drawing property cache: only touch a Drawing when a value really changed
+local setPos, setSize, setVis, setTxt, setCol
+do
 local oc = setmetatable({}, { __mode = "k" })
 local function ocache(obj)
 	local c = oc[obj]
 	if not c then c = {}; oc[obj] = c end
 	return c
 end
-local function setPos(obj, x, y)
+function setPos(obj, x, y)
 	if not obj then return end
 	local c = ocache(obj)
 	if c.x ~= x or c.y ~= y then c.x, c.y = x, y; setp(obj, "Position", Vector2.new(x, y)) end
 end
-local function setSize(obj, w, h)
+function setSize(obj, w, h)
 	if not obj then return end
 	local c = ocache(obj)
 	if c.w ~= w or c.h ~= h then c.w, c.h = w, h; setp(obj, "Size", Vector2.new(w, h)) end
 end
-local function setVis(obj, v)
+function setVis(obj, v)
 	if not obj then return end
 	local c = ocache(obj)
 	if c.v ~= v then c.v = v; setp(obj, "Visible", v) end
 end
-local function setTxt(obj, s)
+function setTxt(obj, s)
 	if not obj then return end
 	local c = ocache(obj)
 	if c.t ~= s then c.t = s; setp(obj, "Text", s) end
 end
-local function setCol(obj, col)
+function setCol(obj, col)
 	if not obj then return end
 	local c = ocache(obj)
 	if c.c ~= col then c.c = col; setp(obj, "Color", col) end
+end
 end
 
 --==============================================================
@@ -224,6 +216,7 @@ pcall(function()
 	if isfile(CAMTYPE_FILE) then camTypeVerified = tonumber(string.match(readfile(CAMTYPE_FILE), "^(%d+)")) end
 end)
 
+do
 local function parseOffset(body, block, key)
 	local ok, r = pcall(function()
 		local v = string.match(body, '"' .. block .. '"%s*:%s*{[^}]-"' .. key .. '"%s*:%s*(%d+)')
@@ -280,6 +273,7 @@ local function refreshOffsets()
 end
 
 pcall(refreshOffsets)
+end
 
 --==============================================================
 -- LEADERBOARD NAME LOGIC (from LeaderboardClient)
@@ -335,13 +329,15 @@ local function cleanText(s)
 	return ok and r or ""
 end
 
+local computeAliases
+do
 local JUNK_NAMES = {
 	bodycolors = true, head = true, torso = true, uppertorso = true, lowertorso = true,
 	humanoidrootpart = true, humanoid = true, animate = true, characterhandler = true,
 	handler = true, health = true, shirt = true, pants = true, hat = true, accessory = true,
 }
 
-local function computeAliases(char)
+function computeAliases(char)
 	local keys = {}
 	pcall(function()
 		for _, c in ipairs(char:GetChildren()) do
@@ -355,10 +351,17 @@ local function computeAliases(char)
 	end)
 	return keys
 end
+end
 
 --==============================================================
 -- MENU CAMERA SCRIPT: finder + disabler
 --==============================================================
+local disableMenuScripts, restoreMenuScripts
+do
+local function readName(i) return i.Name end
+local function readParent(i) return i.Parent end
+local function readDisabled(s) return s.Disabled end
+local function writeDisabled(s, v) s.Disabled = v end
 local function pathOf(inst)
 	local parts, cur = {}, inst
 	for _ = 1, 14 do
@@ -402,7 +405,7 @@ local function printScriptCandidates()
 end
 
 local disabledScripts = {}
-local function disableMenuScripts()
+function disableMenuScripts()
 	pcall(function()
 		if #DISABLE_MENU_SCRIPTS == 0 or next(disabledScripts) ~= nil then return end
 		local set = {}
@@ -421,7 +424,7 @@ local function disableMenuScripts()
 	end)
 end
 
-local function restoreMenuScripts()
+function restoreMenuScripts()
 	pcall(function()
 		for s, prev in pairs(disabledScripts) do
 			pcall(writeDisabled, s, prev)
@@ -431,6 +434,7 @@ local function restoreMenuScripts()
 end
 
 if PRINT_SCRIPT_CANDIDATES then pcall(printScriptCandidates) end
+end
 
 --==============================================================
 -- PLAYER SAMPLING (attributes + name map) — polling, no events
@@ -806,6 +810,8 @@ end
 -- MENU CFRAME FOLLOW (orbit camera) — kept as lean as possible
 -- Orbit angles are changed only in updateOrbit(); this just applies them.
 --==============================================================
+local cfTick
+do
 local function readTarget()
 	local p = specHrp.Position
 	return p.X, p.Y, p.Z
@@ -866,8 +872,9 @@ local function cfFollow()
 	end
 end
 
-local function cfTick()
+function cfTick()
 	if alive() and Spectating and specMode == "cf" and inMenu then pcall(cfFollow) end
+end
 end
 
 -- extra tight-loop writers
@@ -940,8 +947,10 @@ local function trustCheck(ma)
 	end)
 end
 
+local camTypeCheck
+do
 local camTypeHits = 0
-local function camTypeCheck()
+function camTypeCheck()
 	pcall(function()
 		if not offs.camtype or camTypeVerified == offs.camtype or not camAddr then return end
 		local okR, v = pcall(memory_read, "int", camAddr + offs.camtype)
@@ -952,6 +961,7 @@ local function camTypeCheck()
 			camTypeHits = 0
 		end
 	end)
+end
 end
 
 local function damageCheck(mh, myChar)
@@ -972,6 +982,12 @@ end
 --==============================================================
 -- MOUSE + REAL-LEADERBOARD
 --==============================================================
+local mousePos, resolveText, playerFromRealLeaderboard, restoreLeaderboard, tintTick
+do
+local function readText(d) return d.Text end
+local function readTextColor(d) return d.TextColor3 end
+local function writeTextColor(d, c) d.TextColor3 = c end
+local function getDesc(r) return r:GetDescendants() end
 local mouseFns = {
 	function() local v = UserInputService:GetMouseLocation(); return v.X, v.Y end,
 	function() local m = LocalPlayer:GetMouse(); return m.X, m.Y end,
@@ -985,7 +1001,7 @@ local mouseFns = {
 	end,
 }
 local mouseIdx = nil
-local function mousePos()
+function mousePos()
 	if mouseIdx then
 		local ok, x, y = pcall(mouseFns[mouseIdx])
 		if ok and type(x) == "number" and type(y) == "number" then return x, y end
@@ -1016,7 +1032,7 @@ local function isShown(obj, depth)
 	return ok and res == true
 end
 
-local function resolveText(clean, simp, allowLive)
+function resolveText(clean, simp, allowLive)
 	local ok, res = pcall(function()
 		local p = nameMap[simp]
 		if p then return p end
@@ -1099,7 +1115,7 @@ local function lbStep(now)
 	end
 end
 
-local function restoreLeaderboard()
+function restoreLeaderboard()
 	pcall(function()
 		for d in pairs(lbApplied) do
 			if lbOrig[d] ~= nil then writeColorSafe(d, lbOrig[d]) end
@@ -1109,7 +1125,7 @@ local function restoreLeaderboard()
 end
 
 -- light blue = spectated, grey = NOT spawned in, otherwise the game's own colour
-local function tintTick(now)
+function tintTick(now)
 	pcall(lbStep, now)
 	if now < lbNextApply then return end
 	lbNextApply = now + 0.4
@@ -1139,7 +1155,7 @@ local function tintTick(now)
 	end
 end
 
-local function playerFromRealLeaderboard(mx, my)
+function playerFromRealLeaderboard(mx, my)
 	local ok, res = pcall(function()
 		local list = lbList
 		if #list == 0 then
@@ -1173,6 +1189,8 @@ local function playerFromRealLeaderboard(mx, my)
 		return resolveText(clean, simplify(clean), true)
 	end)
 	return ok and res or nil
+end
+
 end
 
 --==============================================================
@@ -1359,12 +1377,14 @@ end
 -- Menu orbit camera, modelled on the default Roblox camera:
 --   hold RIGHT MOUSE + drag = rotate, mouse wheel (or I / O, PageUp / PageDown, = / -) = zoom,
 --   arrow keys also rotate.
+local updateOrbit
+do
 local lastOrbitT, rmbWas, lastMX, lastMY = tick(), false, nil, nil
 local vpW, vpH, vpAt = nil, nil, 0
 local function readVP() local v = workspace.CurrentCamera.ViewportSize; return v.X, v.Y end
 local function getMouseDelta() return UserInputService:GetMouseDelta() end
 
-local function updateOrbit()
+function updateOrbit()
 	local now = tick()
 	local dt = now - lastOrbitT
 	if dt > 0.1 then dt = 0.1 end
@@ -1430,7 +1450,10 @@ local function updateOrbit()
 	if k > 1 then k = 1 end
 	camDist = camDist + (camDistTarget - camDist) * k
 end
+end
 
+local drawOverlay
+do
 local PANEL_TITLE = "Players   [H] = Hide   (click a name to spectate)"
 local drawNextText, lastSpecDrawn = 0, nil
 
@@ -1458,7 +1481,7 @@ local function drawRow(i, d, x, y, refresh)
 	setVis(t, true)
 end
 
-local function drawOverlay()
+function drawOverlay()
 	local x, y = ovX, ovY
 
 	if (not inMenu) or uiHidden then
@@ -1487,6 +1510,7 @@ local function drawOverlay()
 	for p, t in pairs(Rows) do
 		if not inOrder[p] then pcall(function() t:Remove() end) Rows[p] = nil end
 	end
+end
 end
 
 local function frame()
