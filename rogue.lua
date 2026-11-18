@@ -990,9 +990,52 @@ end
 --==============================================================
 local cfTick
 do
-local function readTarget()
-	local p = specHrp.Position
-	return p.X, p.Y, p.Z
+-- Other players' parts only move when their position replicates (a handful of times per second), so
+-- following the raw position is choppy. Instead, every time a new position arrives the focus glides in a
+-- straight line from where it is now to that position, taking slightly longer than the gap between
+-- updates. That gives constant-speed motion with no stops, steps or overshoot, and the small lag that
+-- results corrects itself automatically (the next glide just starts a little closer to being caught up).
+local FOLLOW_LAG = 1.25                    -- glide time as a multiple of the update gap (higher = smoother but more lag, min ~1.0)
+local F = { hrp = nil, est = 0.05 }        -- est = measured time between position updates
+
+local function readTarget(dt)
+	local hrp = specHrp
+	local p = hrp.Position
+	local px, py, pz = p.X, p.Y, p.Z
+	local now = tick()
+
+	if hrp ~= F.hrp then                   -- new target (or respawned): start exactly on it
+		F.hrp = hrp
+		F.rx, F.ry, F.rz = px, py, pz      -- last position received
+		F.sx, F.sy, F.sz = px, py, pz      -- focus shown
+		F.ax, F.ay, F.az = px, py, pz      -- where the current glide started
+		F.t0, F.dur, F.seen = now, F.est * FOLLOW_LAG, now
+		return px, py, pz
+	end
+
+	if px ~= F.rx or py ~= F.ry or pz ~= F.rz then
+		local gap = now - F.seen
+		F.seen = now
+		if gap >= 0.012 and gap < 0.4 then
+			if gap > 0.25 then gap = 0.25 end
+			F.est = F.est + (gap - F.est) * 0.2
+		end
+
+		local ex, ey, ez = px - F.sx, py - F.sy, pz - F.sz
+		if ex * ex + ey * ey + ez * ez > 900 then   -- teleported / respawned far away: snap
+			F.sx, F.sy, F.sz = px, py, pz
+		end
+		F.ax, F.ay, F.az = F.sx, F.sy, F.sz
+		F.rx, F.ry, F.rz = px, py, pz
+		F.t0, F.dur = now, F.est * FOLLOW_LAG
+	end
+
+	local u = (now - F.t0) / F.dur
+	if u > 1 then u = 1 elseif u < 0 then u = 0 end
+	F.sx = F.ax + (F.rx - F.ax) * u
+	F.sy = F.ay + (F.ry - F.ay) * u
+	F.sz = F.az + (F.rz - F.az) * u
+	return F.sx, F.sy, F.sz
 end
 
 local function enforceScriptable()
@@ -1026,14 +1069,16 @@ end
 local cfCalls = 0
 local function cfFollow()
 	if not (Spectating and specMode == "cf" and specHrp and camAddr) then return end
-	local ok, tx, ty, tz = pcall(readTarget)
-	if not ok or type(tx) ~= "number" then return end
-
-	-- ease the shown angles / zoom toward the input targets by the time since the last call (any writer)
+	-- time since the last call (any writer)
 	local now = tick()
 	local dt = now - disp.t
 	disp.t = now
 	if dt > 0.1 then dt = 0.1 elseif dt < 0 then dt = 0 end
+
+	local ok, tx, ty, tz = pcall(readTarget, dt)
+	if not ok or type(tx) ~= "number" then return end
+
+	-- ease the shown angles / zoom toward the input targets by that time
 	local kl = (LOOK_SMOOTH > 0) and (1 - 2.718281828 ^ (-LOOK_SMOOTH * dt)) or 1
 	local kz = (ZOOM_SMOOTH > 0) and (1 - 2.718281828 ^ (-ZOOM_SMOOTH * dt)) or 1
 	disp.yaw = disp.yaw + (camYaw - disp.yaw) * kl
@@ -1603,8 +1648,8 @@ end
 local function pollKeys(now)
 	if now - keysAt < KEY_POLL then return end
 	keysAt = now
-	keys.l  = keyDown(0x25) or keyDown(0x44)                           -- Left arrow / D
-	keys.r  = keyDown(0x27) or keyDown(0x41)                           -- Right arrow / A
+	keys.l  = keyDown(0x25) or keyDown(0x41)                           -- Left arrow / A
+	keys.r  = keyDown(0x27) or keyDown(0x44)                           -- Right arrow / D
 	keys.u  = keyDown(0x26)                                            -- Up arrow
 	keys.d  = keyDown(0x28)                                            -- Down arrow
 	keys.zi = keyDown(0x57) or keyDown(0x21) or keyDown(0xBB)          -- W / PageUp / =
