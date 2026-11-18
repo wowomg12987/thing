@@ -331,7 +331,6 @@ local function logOnce(msg)
 		if not seenMsg[msg] then
 			seenMsg[msg] = true
 			pcall(print, "[SPEC] " .. msg)
-			pcall(notify, msg, "Spectate", 6)
 		end
 	end)
 end
@@ -990,13 +989,22 @@ end
 --==============================================================
 local cfTick
 do
--- Other players' parts only move when their position replicates (a handful of times per second), so
--- following the raw position is choppy. Instead, every time a new position arrives the focus glides in a
--- straight line from where it is now to that position, taking slightly longer than the gap between
--- updates. That gives constant-speed motion with no stops, steps or overshoot, and the small lag that
--- results corrects itself automatically (the next glide just starts a little closer to being caught up).
-local FOLLOW_LAG = 1.25                    -- glide time as a multiple of the update gap (higher = smoother but more lag, min ~1.0)
-local F = { hrp = nil, est = 0.05 }        -- est = measured time between position updates
+-- Other players' parts only get a new position a handful of times per second, so following the raw
+-- position is choppy. Between updates the focus is moved ahead along the player's real velocity (read
+-- from the part; if that isn't available it is measured from the updates), so it tracks where they
+-- actually are right now instead of where they were at the last update. A smoothing pass then hides the
+-- correction when each new update lands (that is what removes the warble); the target is aimed ahead by
+-- the delay that smoothing adds, so the camera still ends up on the player rather than behind them.
+local FOLLOW_SMOOTH = 12                   -- higher = tighter to the player, lower = softer / less warble (the lag it would add is cancelled out)
+local F = { hrp = nil }
+
+local function readVel(hrp)
+	local ok, v = pcall(function() return hrp.AssemblyLinearVelocity end)
+	if not (ok and v and type(v.X) == "number") then
+		ok, v = pcall(function() return hrp.Velocity end)
+	end
+	if ok and v and type(v.X) == "number" then return v.X, v.Y, v.Z end
+end
 
 local function readTarget(dt)
 	local hrp = specHrp
@@ -1006,35 +1014,44 @@ local function readTarget(dt)
 
 	if hrp ~= F.hrp then                   -- new target (or respawned): start exactly on it
 		F.hrp = hrp
-		F.rx, F.ry, F.rz = px, py, pz      -- last position received
+		F.lx, F.ly, F.lz = px, py, pz      -- last position received
 		F.sx, F.sy, F.sz = px, py, pz      -- focus shown
-		F.ax, F.ay, F.az = px, py, pz      -- where the current glide started
-		F.t0, F.dur, F.seen = now, F.est * FOLLOW_LAG, now
+		F.mx, F.my, F.mz = 0, 0, 0         -- velocity measured from the updates (fallback)
+		F.seen = now
 		return px, py, pz
 	end
 
-	if px ~= F.rx or py ~= F.ry or pz ~= F.rz then
+	if px ~= F.lx or py ~= F.ly or pz ~= F.lz then
 		local gap = now - F.seen
 		F.seen = now
-		if gap >= 0.012 and gap < 0.4 then
-			if gap > 0.25 then gap = 0.25 end
-			F.est = F.est + (gap - F.est) * 0.2
+		local mx, my, mz = 0, 0, 0
+		if gap >= 0.012 and gap < 0.25 then
+			mx, my, mz = (px - F.lx) / gap, (py - F.ly) / gap, (pz - F.lz) / gap
 		end
-
-		local ex, ey, ez = px - F.sx, py - F.sy, pz - F.sz
-		if ex * ex + ey * ey + ez * ez > 900 then   -- teleported / respawned far away: snap
-			F.sx, F.sy, F.sz = px, py, pz
-		end
-		F.ax, F.ay, F.az = F.sx, F.sy, F.sz
-		F.rx, F.ry, F.rz = px, py, pz
-		F.t0, F.dur = now, F.est * FOLLOW_LAG
+		F.mx, F.my, F.mz = F.mx + (mx - F.mx) * 0.5, F.my + (my - F.my) * 0.5, F.mz + (mz - F.mz) * 0.5
+		F.lx, F.ly, F.lz = px, py, pz
+	elseif now - F.seen > 0.15 then
+		F.mx, F.my, F.mz = 0, 0, 0
 	end
 
-	local u = (now - F.t0) / F.dur
-	if u > 1 then u = 1 elseif u < 0 then u = 0 end
-	F.sx = F.ax + (F.rx - F.ax) * u
-	F.sy = F.ay + (F.ry - F.ay) * u
-	F.sz = F.az + (F.rz - F.az) * u
+	-- real velocity if the part reports one, otherwise the measured one
+	local vx, vy, vz = F.mx, F.my, F.mz
+	local tx, ty, tz = readVel(hrp)
+	if tx and (tx * tx + ty * ty + tz * tz) > 0.25 then vx, vy, vz = tx, ty, tz end
+
+	local ex = now - F.seen
+	if ex > 0.1 then ex = 0.1 end
+	ex = ex + 1 / FOLLOW_SMOOTH            -- aim ahead by exactly the lag the smoothing adds, so it nets out to none
+	local gx, gy, gz = F.lx + vx * ex, F.ly + vy * ex, F.lz + vz * ex
+
+	local dx, dy, dz = gx - F.sx, gy - F.sy, gz - F.sz
+	if dx * dx + dy * dy + dz * dz > 900 then   -- teleported / respawned far away: snap
+		F.sx, F.sy, F.sz = gx, gy, gz
+		return gx, gy, gz
+	end
+
+	local k = 1 - 2.718281828 ^ (-FOLLOW_SMOOTH * dt)
+	F.sx, F.sy, F.sz = F.sx + dx * k, F.sy + dy * k, F.sz + dz * k
 	return F.sx, F.sy, F.sz
 end
 
@@ -1896,8 +1913,6 @@ pcall(function()
 	conns[#conns + 1] = m.WheelForward:Connect(function() pcall(addWheel, "mouse", 1) end)
 	conns[#conns + 1] = m.WheelBackward:Connect(function() pcall(addWheel, "mouse", -1) end)
 end)
-
-pcall(notify, "Loaded. The player list appears in the main menu.", "Spectate", 4)
 
 end)
 
