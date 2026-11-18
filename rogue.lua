@@ -425,6 +425,7 @@ local camTypeOrig, camTypeWritten, camCheckAt = nil, nil, nil
 local resetUntil = 0
 local inMenu = false
 local cfPropBad, cfErrCount = false, 0
+local cfSubjSet = false                    -- true while menu spectate has CameraSubject pointed at the target
 local camAddr, camObj = nil, nil
 
 -- overlay UI state
@@ -809,10 +810,20 @@ stopSpectating = function(reason)
 						if cur == tonumber(specHumAddr) then memory_write("uintptr_t", ca + offs.subj, origSubject) end
 					end
 				end)
+			elseif mode == "cf" and cfSubjSet then
+				-- menu spectate pointed CameraSubject at the target: give it back (own humanoid, else none)
+				pcall(function()
+					local ca = refreshCam()
+					if not (ca and offs.subj) then return end
+					local mh = myHumanoid()
+					local ma = mh and addrOf(mh)
+					memory_write("uintptr_t", ca + offs.subj, (reason ~= "menu" and ma) or 0)
+				end)
 			end
 		end
 		pcall(restoreCamType)
 	end)
+	cfSubjSet = false
 	camCheckAt = nil
 	runeDecals = {}
 	Spectating, specHumAddr, specBadSince, specHrp, specMode = nil, nil, nil, nil, nil
@@ -880,7 +891,10 @@ local function startSpectating(player)
 		local mode = (inMenu and menuUsesCF()) and "cf" or "subj"
 		if overriding and specMode ~= mode then stopSpectating() end
 
-		-- MENU: CFrame follow (CameraType becomes Scriptable, the subject is left alone)
+		-- MENU: CFrame follow (CameraType becomes Scriptable and we write the CFrame ourselves).
+		-- MenuClient only pans/tweens the camera while CameraSubject is NOT inside the workspace, so
+		-- we also point CameraSubject at the target's Humanoid: that makes its loop stand down
+		-- instead of fighting our CFrame writes (this was the flicker).
 		if mode == "cf" then
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if not hrp then logOnce("Target has no HumanoidRootPart - can't spectate") return false end
@@ -893,6 +907,23 @@ local function startSpectating(player)
 			overriding = true
 			Spectating, specHumAddr, specBadSince, specHrp, specMode = player, nil, nil, hrp, "cf"
 			cfPropBad, cfErrCount = false, 0
+
+			local hum = char:FindFirstChild("Humanoid")
+			local ha = hum and addrOf(hum)
+			if ha and offs.subj then
+				local safe = cfSubjSet
+				if not safe then
+					-- same sanity check as the spawned-in path: the offset must really hold a subject pointer
+					local cur = rdPtr(ca + offs.subj)
+					local mine = myHumanoid()
+					local myAddr = mine and addrOf(mine)
+					if myAddr and cur == tonumber(myAddr) then offsetTrusted = true end
+					safe = offsetTrusted or ((not myAddr) and cur ~= nil and (cur == 0 or cur > 65536))
+				end
+				if safe and pcall(memory_write, "uintptr_t", ca + offs.subj, ha) then
+					cfSubjSet, specHumAddr = true, ha
+				end
+			end
 			return true
 		end
 
@@ -1028,7 +1059,7 @@ end
 --==============================================================
 local function pinSubject()
 	pcall(function()
-		if not (Spectating and specMode == "subj" and specHumAddr and camAddr and offs.subj) then return end
+		if not (Spectating and (specMode == "subj" or (specMode == "cf" and cfSubjSet)) and specHumAddr and camAddr and offs.subj) then return end
 		if specBadSince ~= nil then return end
 		local cur = rdPtr(camAddr + offs.subj)
 		if cur and cur ~= tonumber(specHumAddr) then
@@ -1052,6 +1083,20 @@ local function validateSpec(now)
 			else
 				specBadSince = specBadSince or now
 				if now - specBadSince > 3 then stopSpectating() end
+			end
+			if cfSubjSet and camAddr and offs.subj then
+				-- target respawned / humanoid changed: follow it; if it's gone, never leave a stale pointer behind
+				local hum = char and char:FindFirstChild("Humanoid")
+				local ha = hum and addrOf(hum)
+				if ha then
+					if ha ~= specHumAddr then
+						specHumAddr = ha
+						pcall(memory_write, "uintptr_t", camAddr + offs.subj, ha)
+					end
+				elseif specHumAddr then
+					specHumAddr = nil
+					pcall(memory_write, "uintptr_t", camAddr + offs.subj, 0)
+				end
 			end
 			return
 		end
