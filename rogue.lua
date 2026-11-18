@@ -28,7 +28,37 @@ end
 
 if PLACE_OK then
 
+--==============================================================
+-- WAIT FOR THE GAME TO LOAD (runs only after the place gate passed)
+-- Ready = game:IsLoaded() (if this build has it) + LocalPlayer, PlayerGui and CurrentCamera all exist.
+-- Gives up after 60 s and then runs nothing.
+--==============================================================
+local GAME_READY = false
+pcall(function()
+	local function ready()
+		local okL, loaded = pcall(function() return game:IsLoaded() end)
+		if okL and loaded == false then return false end   -- IsLoaded exists and says "not yet"
+		local ok, r = pcall(function()
+			local lp = game:GetService("Players").LocalPlayer
+			return lp ~= nil and lp:FindFirstChild("PlayerGui") ~= nil and workspace.CurrentCamera ~= nil
+		end)
+		return ok and r == true
+	end
+	local t0 = tick()
+	while not ready() do
+		if tick() - t0 > 60 then return end
+		pcall(wait, 0.25)
+	end
+	GAME_READY = true
+end)
+if not GAME_READY then
+	pcall(print, "[RogueLineage] game did not finish loading - script not started")
+	pcall(notify, "Game didn't finish loading after 60 seconds - script not started. Re-run it once the game has loaded.", "Rogue Lineage", 8)
+end
+
 local mainOk, mainErr = pcall(function()
+
+if not GAME_READY then return end   -- nothing below runs until the game has loaded
 
 local RL = {
 	dir     = "RogueLineage",
