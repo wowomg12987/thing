@@ -1,5 +1,6 @@
 --// Rogue Lineage — Matcha
---//   * Spectate (menu player list) — Matcha port (v13), unchanged apart from being start/stop-able
+--//   * Spectate (menu player list) — Matcha port (v14): leaderboard rows are now also linked to players by
+--//     their on-screen order (the game places row N at (N-1)*20, in a fixed sort order), not only by text
 --//   * "Rogue Lineage" Matcha tab: Spectate on/off toggle + named configs (one JSON file each in
 --//     RogueLineage/configs/, pick which one to load; the last one used is autoloaded at start)
 --//
@@ -28,45 +29,7 @@ end
 
 if PLACE_OK then
 
---==============================================================
--- WAIT FOR THE GAME TO LOAD (runs only after the place gate passed)
--- Ready = game:IsLoaded() (if this build has it) + LocalPlayer, PlayerGui and CurrentCamera all exist.
--- Gives up after 60 s and then runs nothing.
---==============================================================
-local GAME_READY = false
-pcall(function()
-	local function ready()
-		local okL, loaded = pcall(function() return game:IsLoaded() end)
-		if okL and loaded == false then return false end   -- IsLoaded exists and says "not yet"
-		local ok, r = pcall(function()
-			local lp = game:GetService("Players").LocalPlayer
-			return lp ~= nil and lp:FindFirstChild("PlayerGui") ~= nil and workspace.CurrentCamera ~= nil
-		end)
-		return ok and r == true
-	end
-	local t0, fast = tick(), 0
-	while not ready() do
-		local t1 = tick()
-		if t1 - t0 > 60 then return end
-		pcall(wait, 0.25)
-		if tick() - t1 < 0.05 then
-			-- wait() returned instantly (it errored or isn't yielding yet): never spin, give up instead
-			fast = fast + 1
-			if fast >= 20 then return end
-		else
-			fast = 0
-		end
-	end
-	GAME_READY = true
-end)
-if not GAME_READY then
-	pcall(print, "[RogueLineage] game did not finish loading - script not started")
-	pcall(notify, "Game didn't finish loading after 60 seconds - script not started. Re-run it once the game has loaded.", "Rogue Lineage", 8)
-end
-
 local mainOk, mainErr = pcall(function()
-
-if not GAME_READY then return end   -- nothing below runs until the game has loaded
 
 local RL = {
 	dir     = "RogueLineage",
@@ -326,7 +289,7 @@ end)
 local OFFSETS_URL   = "https://offsets.imtheo.lol/offsets.json"
 local CACHE_FILE    = "sp_offsets_cache.json"
 local CAMTYPE_FILE  = "sp_camtype_ok.txt"
-local DEFAULTS = { subj = 176, camtype = 288, campos = 228, camrot = 192, io = 232, mpos = 188 }
+local DEFAULTS = { subj = 176, camtype = 288, campos = 228, camrot = 192, io = 232, mpos = 188, textcolor = 2784 }
 local GAME_CAM_MAX_DIST = 100
 local ROW_H, PANEL_W = 18, 430
 local RESET_WINDOW = 3
@@ -460,7 +423,6 @@ local function sessionInfo()
 end
 local session0 = sessionInfo()
 
-local missSince = nil   -- when the session's identity first went missing (teleport / teardown)
 local function checkSession()
 	local res = false
 	local ok = pcall(function()
@@ -471,21 +433,6 @@ local function checkSession()
 			or (s.dm and session0.dm and s.dm ~= session0.dm) then
 			dead, hopped = true, true
 			res = true
-			return
-		end
-		-- while the old server is being torn down the reads above can come back empty instead of different,
-		-- and LocalPlayer gets unparented. Treat that (for more than half a second) as a hop too.
-		local gone = false
-		pcall(function() gone = (LocalPlayer ~= nil and LocalPlayer.Parent == nil) end)
-		local lost = (session0.lp ~= nil and s.lp == nil) or (session0.dm ~= nil and s.dm == nil) or gone
-		if lost then
-			missSince = missSince or tick()
-			if tick() - missSince > 0.5 then
-				dead, hopped = true, true
-				res = true
-			end
-		else
-			missSince = nil
 		end
 	end)
 	if not ok then return false end
@@ -530,7 +477,7 @@ local nameMap = {}
 -- OFFSETS (updated once, when the script runs)
 --==============================================================
 local offs = { subj = DEFAULTS.subj, camtype = DEFAULTS.camtype, campos = DEFAULTS.campos,
-	camrot = DEFAULTS.camrot, io = DEFAULTS.io, mpos = DEFAULTS.mpos }
+	camrot = DEFAULTS.camrot, io = DEFAULTS.io, mpos = DEFAULTS.mpos, textcolor = DEFAULTS.textcolor }
 local offsetTrusted, camTypeBad, camTypeVerified = false, false, nil
 
 pcall(function()
@@ -557,6 +504,7 @@ local function applyBody(body)
 			camrot  = parseOffset(body, "Camera", "Rotation") or DEFAULTS.camrot,
 			io      = parseOffset(body, "MouseService", "InputObject") or DEFAULTS.io,
 			mpos    = parseOffset(body, "MouseService", "MousePosition") or DEFAULTS.mpos,
+			textcolor = parseOffset(body, "GuiObject", "TextColor3") or DEFAULTS.textcolor,
 		}
 		local changed = false
 		for k, v in pairs(n) do
@@ -1405,9 +1353,38 @@ end
 local mousePos, resolveText, playerFromRealLeaderboard, restoreLeaderboard, tintTick
 do
 local function readText(d) return d.Text end
-local function readTextColor(d) return d.TextColor3 end
-local function writeTextColor(d, c) d.TextColor3 = c end
 local function getDesc(r) return r:GetDescendants() end
+
+-- leaderboard name colours as float triples (0..1), written straight into the label's TextColor3 memory
+-- (the property write is not supported by this Matcha build)
+local LB_RED  = { 1, 0, 0 }                           -- spawned in (255, 0, 0)
+local LB_BLUE = { 120 / 255, 200 / 255, 1 }           -- spectated
+local LB_GREY = { 130 / 255, 130 / 255, 130 / 255 }   -- NOT spawned in
+
+local function colEq(a, b)
+	return abs(a[1] - b[1]) < 0.01 and abs(a[2] - b[2]) < 0.01 and abs(a[3] - b[3]) < 0.01
+end
+
+-- returns {r, g, b} or nil when what sits at the offset doesn't look like a colour (wrong / outdated offset)
+local function readTextColor(d)
+	local off, a = offs.textcolor, d.Address
+	if not (off and a) then return nil end
+	local r = memory_read("float", a + off)
+	local g = memory_read("float", a + off + 4)
+	local b = memory_read("float", a + off + 8)
+	if type(r) ~= "number" or type(g) ~= "number" or type(b) ~= "number" then return nil end
+	if r ~= r or g ~= g or b ~= b then return nil end
+	if r < -0.01 or r > 1.01 or g < -0.01 or g > 1.01 or b < -0.01 or b > 1.01 then return nil end
+	return { r, g, b }
+end
+
+local function writeTextColor(d, c)
+	local off, a = offs.textcolor, d.Address
+	if not (off and a) then return end
+	memory_write("float", a + off, c[1])
+	memory_write("float", a + off + 4, c[2])
+	memory_write("float", a + off + 8, c[3])
+end
 local mouseFns = {
 	function() local v = UserInputService:GetMouseLocation(); return v.X, v.Y end,
 	function() local m = LocalPlayer:GetMouse(); return m.X, m.Y end,
@@ -1498,7 +1475,72 @@ local function findLbRoot()
 	return pg and pg:FindFirstChild("LeaderboardGui")
 end
 
-local function writeColorSafe(d, c) return pcall(writeTextColor, d, c) end
+-- a label is only touched through memory while it is still inside the CURRENT LeaderboardGui
+-- (a destroyed / recreated leaderboard must never be written to)
+local function labelAlive(d)
+	local ok, res = pcall(function()
+		local root = findLbRoot()
+		if not root then return false end
+		local ra = addrOf(root)
+		local cur = d
+		for _ = 1, 12 do
+			local par = cur.Parent
+			if par == nil then return false end
+			local pa = addrOf(par)
+			if pa and ra and pa == ra then return true end
+			cur = par
+		end
+		return false
+	end)
+	return ok and res == true
+end
+
+local function writeColorSafe(d, c)
+	if not labelAlive(d) then return false end
+	return pcall(writeTextColor, d, c)
+end
+
+-- Row N on screen = Nth player in the game's sort order (no text needed).
+-- Both maps place each shown row at Position = (0, 0, 0, (N-1) * 20) and show a player when their
+-- FirstName is non-empty and Hidden is false. Gaia never lists you while you are hidden; Khei always lists you.
+local KHEI = false
+pcall(function() KHEI = (tonumber(game.PlaceId) == 3541987450) end)
+
+local function mapRowsByOrder()
+	local byAddr = {}
+	pcall(function()
+		local root = findLbRoot()
+		local sf = root.MainFrame.ScrollingFrame
+		local rows = {}
+		for _, r in ipairs(sf:GetChildren()) do
+			local okV, vis = pcall(function() return r.Visible end)
+			local okT, txt = pcall(readText, r)
+			if okV and vis == true and okT and type(txt) == "string" then
+				local y
+				local okP, py = pcall(function() return r.Position.Y.Offset end)
+				if okP and type(py) == "number" then y = py end
+				if y == nil then
+					local okA, ay = pcall(function() return r.AbsolutePosition.Y end)
+					if okA then y = ay end
+				end
+				rows[#rows + 1] = { addr = addrOf(r), y = y or 0 }
+			end
+		end
+		table.sort(rows, function(a, b) return a.y < b.y end)
+
+		local expected = {}
+		for _, d in ipairs(Order) do
+			local shown = (not d.hidden) or d.revealed or (KHEI and d.player == LocalPlayer)
+			if d.first and d.first ~= "" and shown then expected[#expected + 1] = d.player end
+		end
+
+		if #rows ~= #expected then return end   -- out of sync with the game's list: skip this pass
+		for i, r in ipairs(rows) do
+			if r.addr then byAddr[r.addr] = expected[i] end
+		end
+	end)
+	return byAddr
+end
 
 local function lbStep(now)
 	if not lbBuild then
@@ -1524,6 +1566,25 @@ local function lbStep(now)
 	end
 	b.i = last + 1
 	if b.i > #b.descs then
+		-- fill labels the text couldn't resolve using their on-screen order
+		local byPos = mapRowsByOrder()
+
+		-- self-check against the text matches: any contradiction means the order list is off, so don't use it
+		local clash = 0
+		for _, d in ipairs(b.list) do
+			local a = addrOf(d)
+			local op = a and byPos[a]
+			if op and b.map[d] and b.map[d] ~= op then clash = clash + 1 end
+		end
+		if clash == 0 then
+			for _, d in ipairs(b.list) do
+				if not b.map[d] then
+					local a = addrOf(d)
+					if a and byPos[a] then b.map[d] = byPos[a] end
+				end
+			end
+		end
+
 		lbList, lbMap, lbListAt, lbBuild = b.list, b.map, now, nil
 		-- put back labels that are no longer mapped to a player
 		for d in pairs(lbApplied) do
@@ -1544,7 +1605,8 @@ function restoreLeaderboard()
 	end)
 end
 
--- light blue = spectated, grey = NOT spawned in, otherwise the game's own colour
+-- light blue = spectated, red = spawned in, grey = NOT spawned in
+-- (the game's own colour is remembered per label and put back when a label is no longer tinted)
 function tintTick(now)
 	pcall(lbStep, now)
 	if now < lbNextApply then return end
@@ -1553,20 +1615,24 @@ function tintTick(now)
 		pcall(function()
 			local want = nil
 			if pl == Spectating then
-				want = LBLUE
+				want = LB_BLUE
 			else
 				local dd = Data[pl]
-				if dd and not dd.spawned then want = GREY end
+				if dd then
+					if dd.spawned then want = LB_RED else want = LB_GREY end
+				end
 			end
 			if want then
+				if not labelAlive(d) then return end
+				local cur = readTextColor(d)
+				if not cur then return end   -- offset doesn't point at a colour: don't write anything
 				if lbOrig[d] == nil then
-					local okC, c = pcall(readTextColor, d)
-					if okC and c then lbOrig[d] = c end
+					lbOrig[d] = cur
+				elseif lbApplied[d] ~= nil and not colEq(cur, lbApplied[d]) then
+					lbOrig[d] = cur          -- the game changed the colour itself (e.g. MaxEdict): remember the new one
 				end
-				if lbOrig[d] ~= nil then
-					writeColorSafe(d, want)
-					lbApplied[d] = want
-				end
+				if not colEq(cur, want) then writeColorSafe(d, want) end
+				lbApplied[d] = want
 			elseif lbApplied[d] ~= nil then
 				if lbOrig[d] ~= nil then writeColorSafe(d, lbOrig[d]) end
 				lbApplied[d], lbOrig[d] = nil, nil
@@ -1587,7 +1653,7 @@ function playerFromRealLeaderboard(mx, my)
 			list = descs
 		end
 
-		local bestArea, bestTxt
+		local bestArea, bestTxt, bestD
 		for _, d in ipairs(list) do
 			pcall(function()
 				local okT, txt = pcall(readText, d)
@@ -1598,13 +1664,30 @@ function playerFromRealLeaderboard(mx, my)
 						if size and (size.X or 0) > 0 and (size.Y or 0) > 0 then w, h = size.X, size.Y end
 						if mx >= pos.X and mx <= pos.X + w and my >= pos.Y and my <= pos.Y + h and isShown(d, 8) then
 							local area = w * h
-							if not bestArea or area < bestArea then bestArea, bestTxt = area, txt end
+							if not bestArea or area < bestArea then bestArea, bestTxt, bestD = area, txt, d end
 						end
 					end
 				end
 			end)
 		end
 		if not bestTxt then return nil end
+
+		-- the cached text/order map is the most reliable answer; if the click landed on the small
+		-- "#prestige" child label, use its parent row's player
+		if bestD then
+			local pl = lbMap[bestD]
+			if not pl then
+				local pa
+				pcall(function() pa = addrOf(bestD.Parent) end)
+				if pa then
+					for k, v in pairs(lbMap) do
+						if addrOf(k) == pa then pl = v break end
+					end
+				end
+			end
+			if pl then return pl end
+		end
+
 		local clean = cleanText(bestTxt)
 		return resolveText(clean, simplify(clean), true)
 	end)
@@ -1697,7 +1780,6 @@ local function cleanup()
 	pcall(function()
 		for p, t in pairs(Rows) do pcall(function() t:Remove() end) Rows[p] = nil end
 	end)
-	if hopped then return end   -- the old session is gone: never write to its instances
 	pcall(restoreLeaderboard)
 	pcall(function()
 		for p, d in pairs(Data) do
