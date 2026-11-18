@@ -284,12 +284,12 @@ local KEY_ZOOM      = 1.4                 -- I/O, PageUp/PageDown, =/-  (zoom fa
 local WHEEL_ZOOM    = 0.85                -- distance multiplier per wheel notch
 local ZOOM_SMOOTH   = 14                  -- higher = snappier zoom (0 = instant)
 local MOUSE_RECENTER = true               -- warps the cursor to screen centre if you drag into an edge
-local LOOK_SMOOTH   = 40                  -- how fast the shown camera angle catches up to your mouse (higher = tighter, 0 = raw / no smoothing)
+local LOOK_SMOOTH   = 60                  -- how fast the shown camera angle catches up to your mouse (higher = tighter, 0 = raw / no smoothing)
 local ZOOM_DRAG     = 0.006               -- middle-mouse drag zoom, per pixel (drag down = out, up = in)
 local KEY_POLL      = 0.03                -- seconds between keyboard reads for the orbit keys (state is reused in between)
 
 -- flicker vs lag: each extra writer fights the game's camera harder but costs speed
-local DRIVER_THREADS = 1                  -- tight-loop camera writers (RenderStepped + Heartbeat also write)
+local DRIVER_THREADS = 0                  -- tight-loop camera writers (RenderStepped + Heartbeat also write)
 
 local LBLUE = Color3.fromRGB(120, 200, 255)   -- spectated player
 local GREY  = Color3.fromRGB(130, 130, 130)   -- NOT spawned in
