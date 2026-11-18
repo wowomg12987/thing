@@ -44,10 +44,18 @@ pcall(function()
 		end)
 		return ok and r == true
 	end
-	local t0 = tick()
+	local t0, fast = tick(), 0
 	while not ready() do
-		if tick() - t0 > 60 then return end
+		local t1 = tick()
+		if t1 - t0 > 60 then return end
 		pcall(wait, 0.25)
+		if tick() - t1 < 0.05 then
+			-- wait() returned instantly (it errored or isn't yielding yet): never spin, give up instead
+			fast = fast + 1
+			if fast >= 20 then return end
+		else
+			fast = 0
+		end
 	end
 	GAME_READY = true
 end)
@@ -452,6 +460,7 @@ local function sessionInfo()
 end
 local session0 = sessionInfo()
 
+local missSince = nil   -- when the session's identity first went missing (teleport / teardown)
 local function checkSession()
 	local res = false
 	local ok = pcall(function()
@@ -462,6 +471,21 @@ local function checkSession()
 			or (s.dm and session0.dm and s.dm ~= session0.dm) then
 			dead, hopped = true, true
 			res = true
+			return
+		end
+		-- while the old server is being torn down the reads above can come back empty instead of different,
+		-- and LocalPlayer gets unparented. Treat that (for more than half a second) as a hop too.
+		local gone = false
+		pcall(function() gone = (LocalPlayer ~= nil and LocalPlayer.Parent == nil) end)
+		local lost = (session0.lp ~= nil and s.lp == nil) or (session0.dm ~= nil and s.dm == nil) or gone
+		if lost then
+			missSince = missSince or tick()
+			if tick() - missSince > 0.5 then
+				dead, hopped = true, true
+				res = true
+			end
+		else
+			missSince = nil
 		end
 	end)
 	if not ok then return false end
@@ -1673,6 +1697,7 @@ local function cleanup()
 	pcall(function()
 		for p, t in pairs(Rows) do pcall(function() t:Remove() end) Rows[p] = nil end
 	end)
+	if hopped then return end   -- the old session is gone: never write to its instances
 	pcall(restoreLeaderboard)
 	pcall(function()
 		for p, d in pairs(Data) do
