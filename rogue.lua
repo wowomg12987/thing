@@ -280,12 +280,11 @@ local MIN_DIST, MAX_DIST = 2, 200
 -- camera feel
 local LOOK_SENS     = 0.0065              -- radians per pixel (raise = faster turning)
 local KEY_TURN      = 2.4                 -- Left/Right/Up/Down arrows, radians per second
-local KEY_ZOOM      = 1.4                 -- I/O, PageUp/PageDown, =/-  (zoom factor per second)
+local KEY_ZOOM      = 1.4                 -- W/S, PageUp/PageDown, =/-  (zoom factor per second)
 local WHEEL_ZOOM    = 0.85                -- distance multiplier per wheel notch
 local ZOOM_SMOOTH   = 14                  -- higher = snappier zoom (0 = instant)
 local MOUSE_RECENTER = true               -- warps the cursor to screen centre if you drag into an edge
 local LOOK_SMOOTH   = 60                  -- how fast the shown camera angle catches up to your mouse (higher = tighter, 0 = raw / no smoothing)
-local ZOOM_DRAG     = 0.006               -- middle-mouse drag zoom, per pixel (drag down = out, up = in)
 local KEY_POLL      = 0.03                -- seconds between keyboard reads for the orbit keys (state is reused in between)
 
 -- flicker vs lag: each extra writer fights the game's camera harder but costs speed
@@ -1579,7 +1578,7 @@ end
 
 -- Menu orbit camera, modelled on the default Roblox camera:
 --   hold RIGHT MOUSE + drag = rotate, arrow keys also rotate.
---   zoom = mouse wheel, or I / O, PageUp / PageDown, = / -, or hold MIDDLE MOUSE + drag up/down.
+--   zoom = mouse wheel scroll, or W / S, PageUp / PageDown, = / -.
 -- This only reads input and moves the TARGETS (camYaw / camPitch / camDistTarget); cfFollow eases the shown camera toward them.
 local updateOrbit
 do
@@ -1598,8 +1597,8 @@ local function pollKeys(now)
 	keys.r  = keyDown(0x27)                                            -- Right
 	keys.u  = keyDown(0x26)                                            -- Up
 	keys.d  = keyDown(0x28)                                            -- Down
-	keys.zi = keyDown(0x49) or keyDown(0x21) or keyDown(0xBB)          -- I / PageUp / =
-	keys.zo = keyDown(0x4F) or keyDown(0x22) or keyDown(0xBD)          -- O / PageDown / -
+	keys.zi = keyDown(0x57) or keyDown(0x21) or keyDown(0xBB)          -- W / PageUp / =
+	keys.zo = keyDown(0x53) or keyDown(0x22) or keyDown(0xBD)          -- S / PageDown / -
 end
 
 function updateOrbit()
@@ -1614,10 +1613,9 @@ function updateOrbit()
 	end
 
 	local look = inp.m2 and not dragging
-	local zdrag = (not look) and (not dragging) and keyDown(0x04)    -- middle mouse held: drag up/down to zoom
 
-	-- mouse look / middle-mouse zoom
-	if look or zdrag then
+	-- mouse look
+	if look then
 		interactAt = now
 		local mx, my = mousePos()
 		local dx, dy
@@ -1649,12 +1647,8 @@ function updateOrbit()
 		end
 
 		if dx then
-			if look then
-				camYaw = camYaw - dx * LOOK_SENS
-				camPitch = clamp(camPitch + dy * LOOK_SENS, -1.2, 1.4)
-			else
-				camDistTarget = clamp(camDistTarget * (2.718281828 ^ (dy * ZOOM_DRAG)), MIN_DIST, MAX_DIST)
-			end
+			camYaw = camYaw - dx * LOOK_SENS
+			camPitch = clamp(camPitch + dy * LOOK_SENS, -1.2, 1.4)
 		end
 	else
 		rmbWas, lastMX, lastMY = false, nil, nil
@@ -1682,7 +1676,7 @@ end
 
 local drawOverlay, updateDrag
 do
-local PANEL_TITLE = "Players   [H] = Hide   (click a name to spectate)"
+local PANEL_TITLE = "Players   [H] = Hide   [W/S] = Zoom"
 local drawNextText, lastSpecDrawn = 0, nil
 
 local function drawRow(i, d, x, y, refresh)
