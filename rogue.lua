@@ -1686,7 +1686,7 @@ end
 
 local drawOverlay, updateDrag
 do
-local PANEL_TITLE = "Players   [H] = Hide   [W/S] = Zoom   [A/D] = Orbit"
+local PANEL_TITLE = "Players   [H] = Hide   [W/S] = Zoom"
 local drawNextText, lastSpecDrawn = 0, nil
 
 local function drawRow(i, d, x, y, refresh)
