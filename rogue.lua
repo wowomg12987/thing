@@ -280,8 +280,8 @@ local MIN_DIST, MAX_DIST = 0, 200         -- 0 = camera sits right inside the ch
 -- camera feel
 local LOOK_SENS     = 0.0065              -- radians per pixel (raise = faster turning)
 local KEY_TURN      = 2.4                 -- Left/Right/Up/Down arrows, radians per second
-local KEY_ZOOM      = 1.4                 -- W/S, PageUp/PageDown, =/-  (zoom factor per second)
-local WHEEL_ZOOM    = 0.85                -- distance multiplier per wheel notch
+local KEY_ZOOM      = 45                  -- W/S, PageUp/PageDown, =/-  (studs per second, constant speed)
+local WHEEL_ZOOM    = 7                   -- studs per wheel notch
 local ZOOM_SMOOTH   = 14                  -- higher = snappier zoom (0 = instant)
 local MOUSE_RECENTER = true               -- warps the cursor to screen centre if you drag into an edge
 local LOOK_SMOOTH   = 60                  -- how fast the shown camera angle catches up to your mouse (higher = tighter, 0 = raw / no smoothing)
@@ -1594,24 +1594,19 @@ local keys, keysAt = { l = false, r = false, u = false, d = false, zi = false, z
 local function readVP() local v = workspace.CurrentCamera.ViewportSize; return v.X, v.Y end
 local function getMouseDelta() return UserInputService:GetMouseDelta() end
 
--- multiplicative zoom (f < 1 = in, f > 1 = out). Snaps to 0 when very close, and zooming out from
--- 0 starts from a small distance, so you can always get back out.
-local function zoomBy(f)
-	local d = camDistTarget
-	if f > 1 and d < 0.5 then d = 0.5 end
-	d = d * f
-	if d < 0.1 then d = 0 end
-	camDistTarget = clamp(d, MIN_DIST, MAX_DIST)
+-- constant-speed zoom: delta is in studs (negative = in, positive = out)
+local function zoomBy(delta)
+	camDistTarget = clamp(camDistTarget + delta, MIN_DIST, MAX_DIST)
 end
 
 -- the orbit keys are read every KEY_POLL seconds and the state reused in between (the camera still moves every frame, by dt)
 local function pollKeys(now)
 	if now - keysAt < KEY_POLL then return end
 	keysAt = now
-	keys.l  = keyDown(0x25) or keyDown(0x41)                           -- Left / A
-	keys.r  = keyDown(0x27) or keyDown(0x44)                           -- Right / D
-	keys.u  = keyDown(0x26)                                            -- Up
-	keys.d  = keyDown(0x28)                                            -- Down
+	keys.l  = keyDown(0x25) or keyDown(0x44)                           -- Left arrow / D
+	keys.r  = keyDown(0x27) or keyDown(0x41)                           -- Right arrow / A
+	keys.u  = keyDown(0x26)                                            -- Up arrow
+	keys.d  = keyDown(0x28)                                            -- Down arrow
 	keys.zi = keyDown(0x57) or keyDown(0x21) or keyDown(0xBB)          -- W / PageUp / =
 	keys.zo = keyDown(0x53) or keyDown(0x22) or keyDown(0xBD)          -- S / PageDown / -
 end
@@ -1678,12 +1673,12 @@ function updateOrbit()
 
 	-- zoom: wheel notches + keys (cfFollow smooths the distance)
 	if wheelAcc ~= 0 then
-		zoomBy(WHEEL_ZOOM ^ wheelAcc)
+		zoomBy(-wheelAcc * WHEEL_ZOOM)
 		wheelAcc = 0
 		interactAt = now
 	end
-	if keys.zi then zoomBy(1 / (1 + KEY_ZOOM * dt)) end
-	if keys.zo then zoomBy(1 + KEY_ZOOM * dt) end
+	if keys.zi then zoomBy(-KEY_ZOOM * dt) end
+	if keys.zo then zoomBy(KEY_ZOOM * dt) end
 
 	if keys.l or keys.r or keys.u or keys.d or keys.zi or keys.zo then interactAt = now end
 end
