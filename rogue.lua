@@ -275,7 +275,7 @@ local OVERLAY_X, OVERLAY_Y = 20, 200      -- starting position (drag the header 
 local REVEAL_HIDDEN = false               -- true = unhide hidden players while in the menu
 local MENU_METHOD   = "cf"                -- "cf" = CFrame follow, "subj" = CameraSubject
 local FOLLOW_DIST   = 12                  -- starting menu follow distance
-local MIN_DIST, MAX_DIST = 2, 200
+local MIN_DIST, MAX_DIST = 0, 200         -- 0 = camera sits right inside the character
 
 -- camera feel
 local LOOK_SENS     = 0.0065              -- radians per pixel (raise = faster turning)
@@ -1049,15 +1049,20 @@ local function cfFollow()
 	local py = fy + camDist * sin(disp.pitch)
 	local pz = fz + camDist * cos(disp.yaw) * cp
 
+	-- aim one unit back toward the character along the orbit direction. Same view as looking at the
+	-- character when zoomed out, but it stays valid at distance 0 (camera inside the character)
+	local ux, uy, uz = sin(disp.yaw) * cp, sin(disp.pitch), cos(disp.yaw) * cp
+	local lx, ly, lz = px - ux, py - uy, pz - uz
+
 	if not cfPropBad and camObj then
-		if pcall(writeCamProp, px, py, pz, fx, fy, fz) then
+		if pcall(writeCamProp, px, py, pz, lx, ly, lz) then
 			cfErrCount = 0
 		else
 			cfErrCount = cfErrCount + 1
 			if cfErrCount >= 5 then cfPropBad = true end
 		end
 	elseif cfPropBad and offs.camrot and offs.campos then
-		pcall(writeCamMem, px, py, pz, fx, fy, fz)
+		pcall(writeCamMem, px, py, pz, lx, ly, lz)
 	end
 end
 
@@ -1577,7 +1582,7 @@ local function handleClicks()
 end
 
 -- Menu orbit camera, modelled on the default Roblox camera:
---   hold RIGHT MOUSE + drag = rotate, arrow keys also rotate.
+--   hold RIGHT MOUSE + drag = rotate, A / D or the arrow keys also orbit around the player.
 --   zoom = mouse wheel scroll, or W / S, PageUp / PageDown, = / -.
 -- This only reads input and moves the TARGETS (camYaw / camPitch / camDistTarget); cfFollow eases the shown camera toward them.
 local updateOrbit
@@ -1589,12 +1594,22 @@ local keys, keysAt = { l = false, r = false, u = false, d = false, zi = false, z
 local function readVP() local v = workspace.CurrentCamera.ViewportSize; return v.X, v.Y end
 local function getMouseDelta() return UserInputService:GetMouseDelta() end
 
+-- multiplicative zoom (f < 1 = in, f > 1 = out). Snaps to 0 when very close, and zooming out from
+-- 0 starts from a small distance, so you can always get back out.
+local function zoomBy(f)
+	local d = camDistTarget
+	if f > 1 and d < 0.5 then d = 0.5 end
+	d = d * f
+	if d < 0.1 then d = 0 end
+	camDistTarget = clamp(d, MIN_DIST, MAX_DIST)
+end
+
 -- the orbit keys are read every KEY_POLL seconds and the state reused in between (the camera still moves every frame, by dt)
 local function pollKeys(now)
 	if now - keysAt < KEY_POLL then return end
 	keysAt = now
-	keys.l  = keyDown(0x25)                                            -- Left
-	keys.r  = keyDown(0x27)                                            -- Right
+	keys.l  = keyDown(0x25) or keyDown(0x41)                           -- Left / A
+	keys.r  = keyDown(0x27) or keyDown(0x44)                           -- Right / D
 	keys.u  = keyDown(0x26)                                            -- Up
 	keys.d  = keyDown(0x28)                                            -- Down
 	keys.zi = keyDown(0x57) or keyDown(0x21) or keyDown(0xBB)          -- W / PageUp / =
@@ -1663,12 +1678,12 @@ function updateOrbit()
 
 	-- zoom: wheel notches + keys (cfFollow smooths the distance)
 	if wheelAcc ~= 0 then
-		camDistTarget = clamp(camDistTarget * (WHEEL_ZOOM ^ wheelAcc), MIN_DIST, MAX_DIST)
+		zoomBy(WHEEL_ZOOM ^ wheelAcc)
 		wheelAcc = 0
 		interactAt = now
 	end
-	if keys.zi then camDistTarget = clamp(camDistTarget / (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST) end
-	if keys.zo then camDistTarget = clamp(camDistTarget * (1 + KEY_ZOOM * dt), MIN_DIST, MAX_DIST) end
+	if keys.zi then zoomBy(1 / (1 + KEY_ZOOM * dt)) end
+	if keys.zo then zoomBy(1 + KEY_ZOOM * dt) end
 
 	if keys.l or keys.r or keys.u or keys.d or keys.zi or keys.zo then interactAt = now end
 end
@@ -1676,7 +1691,7 @@ end
 
 local drawOverlay, updateDrag
 do
-local PANEL_TITLE = "Players   [H] = Hide   [W/S] = Zoom"
+local PANEL_TITLE = "Players   [H] = Hide   [W/S] = Zoom   [A/D] = Orbit"
 local drawNextText, lastSpecDrawn = 0, nil
 
 local function drawRow(i, d, x, y, refresh)
