@@ -298,8 +298,12 @@ local abs, sqrt, sin, cos, floor = math.abs, math.sqrt, math.sin, math.cos, math
 --==============================================================
 -- HELPERS
 --==============================================================
-local function setp(obj, name, value)
-	return pcall(function() obj[name] = value end)
+local setp
+do
+local function rawSet(obj, name, value) obj[name] = value end
+function setp(obj, name, value)
+	return pcall(rawSet, obj, name, value)
+end
 end
 
 local function setTextSize(t, n)
@@ -666,7 +670,7 @@ end
 task.spawn(function()
 	while alive() do
 		pcall(function()
-			if not checkSession() then pcall(sample) end
+			if not dragging and not checkSession() then pcall(sample) end
 		end)
 		pcall(wait, 1.0)
 	end
@@ -1047,7 +1051,7 @@ for _ = 1, DRIVER_THREADS do
 	pcall(function()
 		task.spawn(function()
 			while alive() do
-				pcall(cfTick)
+				if not dragging then pcall(cfTick) end
 				pcall(wait)
 			end
 		end)
@@ -1419,7 +1423,7 @@ local function stateTick()
 		pcall(runeTick)
 		pcall(followCheck, now)
 	end
-	pcall(tintTick, now)
+	if not dragging then pcall(tintTick, now) end
 end
 
 task.spawn(function()
@@ -1493,16 +1497,26 @@ local function handleHideKey()
 	if edge and inp.active then toggleHide() end
 end
 
-local function clampOverlay()
-	pcall(function()
-		local vp = workspace.CurrentCamera.ViewportSize
-		if vp and vp.X and vp.Y then
-			ovX = clamp(ovX, 6, math.max(6, vp.X - 60))
-			ovY = clamp(ovY, 6, math.max(6, vp.Y - 40))
-		end
-	end)
+local clampOverlay
+do
+local vpX, vpY, vpAt = nil, nil, 0
+function clampOverlay()
+	local now = tick()
+	if not vpX or now - vpAt > 1 then
+		vpAt = now
+		local ok, w, h = pcall(function()
+			local v = workspace.CurrentCamera.ViewportSize
+			return v.X, v.Y
+		end)
+		if ok and type(w) == "number" then vpX, vpY = w, h end
+	end
+	if vpX then
+		ovX = clamp(ovX, 6, math.max(6, vpX - 60))
+		ovY = clamp(ovY, 6, math.max(6, vpY - 40))
+	end
 	if ovX < 6 then ovX = 6 end
 	if ovY < 6 then ovY = 6 end
+end
 end
 
 local function handleClicks()
@@ -1512,18 +1526,7 @@ local function handleClicks()
 	local clicked = edge1 or edge2
 	local active = inp.active
 
-	-- dragging the overlay by its header
-	if dragging then
-		if d1 and active and inMenu and not uiHidden then
-			local dxm, dym = mousePos()
-			if dxm then
-				ovX, ovY = dxm - dragOX, dym - dragOY
-				clampOverlay()
-			end
-		else
-			dragging = false
-		end
-	end
+	-- (overlay dragging is handled by updateDrag, first thing in the frame)
 
 	local mx, my
 	if clicked and active then mx, my = mousePos() else clicked = false end
@@ -1630,7 +1633,7 @@ function updateOrbit()
 end
 end
 
-local drawOverlay
+local drawOverlay, updateDrag
 do
 local PANEL_TITLE = "Players   [H] = Hide   (click a name to spectate)"
 local drawNextText, lastSpecDrawn = 0, nil
@@ -1659,6 +1662,28 @@ local function drawRow(i, d, x, y, refresh)
 	setVis(t, true)
 end
 
+-- moves the overlay while its header is held; runs first in the frame, touches only positions
+function updateDrag()
+	if not dragging then return end
+	if not (inp.m1 and inp.active and inMenu and not uiHidden) then
+		dragging = false
+		return
+	end
+	local mx, my = mousePos()
+	if not mx then return end
+	local nx, ny = mx - dragOX, my - dragOY
+	if nx == ovX and ny == ovY then return end
+	ovX, ovY = nx, ny
+	clampOverlay()
+	local x, y = ovX, ovY
+	setPos(Panel, x - 6, y - 6)
+	setPos(Header, x, y)
+	for i, d in ipairs(Order) do
+		local t = Rows[d.player]
+		if t then setPos(t, x, y + 6 + i * ROW_H) end
+	end
+end
+
 function drawOverlay()
 	local x, y = ovX, ovY
 
@@ -1670,7 +1695,7 @@ function drawOverlay()
 	end
 
 	local now = tick()
-	local refresh = (now >= drawNextText) or (lastSpecDrawn ~= Spectating)
+	local refresh = not dragging and ((now >= drawNextText) or (lastSpecDrawn ~= Spectating))
 	if refresh then drawNextText = now + 0.2; lastSpecDrawn = Spectating end
 
 	setPos(Panel, x - 6, y - 6)
@@ -1693,6 +1718,7 @@ end
 
 local function frame()
 	pcall(pollInput)
+	pcall(updateDrag)         -- move the overlay first, right after reading the mouse
 	pcall(handleHideKey)
 	pcall(updateOrbit)        -- input first ...
 	pcall(cfTick)             -- ... then apply it immediately (writer #1)
@@ -1724,7 +1750,9 @@ end)
 
 -- writer #2
 pcall(function()
-	conns[#conns + 1] = RunService.Heartbeat:Connect(function() pcall(cfTick) end)
+	conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+		if not dragging then pcall(cfTick) end
+	end)
 end)
 
 -- event-based H (never misses a quick tap) and mouse wheel zoom
